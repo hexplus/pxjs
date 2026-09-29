@@ -1,104 +1,27 @@
 # PXJS
 
-PXJS is a JavaScript engine written from scratch for [PSPX](../README.md). It targets the Sony PSP-1000: a 333 MHz in-order MIPS CPU, 32 MB of RAM, and a single-precision FPU, which means every `double` operation is a software routine.
+**PXJS is a compact JavaScript engine for memory-constrained 32-bit systems, originally built for [PSPX](https://github.com/hexplus/pspx) and the Sony PSP.**
 
-It is a standalone C library with no dependencies beyond libc and libm. It builds for the PSP with PSPDEV, and for a 32-bit host for testing. PSPX embeds it, but the engine does not depend on PSPX.
+It is written from scratch in C and targets the PSP-1000 as its reference platform: a 333 MHz in-order MIPS CPU with 32 MB of RAM and no hardware double-precision floating point.
 
-> **Status:** tested on the host (ASan, UBSan, GC-stress mode) and in the PPSSPP emulator. **Not yet run on a real PSP.**
+PXJS currently passes **98.8% of its applicable ECMAScript 2023 Test262 baseline** — **34,054 of 34,460 tests** on the pinned Test262 commit `7ab7fafa`.
 
-## What it supports
+It is a standalone C library with no dependencies beyond libc and libm. PXJS builds for the PSP using PSPDEV and for 32-bit host systems for testing. PSPX embeds PXJS, but PXJS has no dependency on PSPX.
 
-- **Language: most of ES2023.**
-  - Classes, including fields, static blocks and private `#x`.
-  - Destructuring, spread, template literals, optional chaining and `??`.
-  - Generators, async/await, async generators and `for await`.
-  - ES modules with top-level `await`, labels, getters and setters.
-- **Built-ins:**
-  - The Object, Array (including the ES2023 copying methods), String, Number, Math, JSON, Date and Symbol APIs.
-  - RegExp with lookbehind, named groups and `\p{…}`.
-  - Map and Set, including the ES2025 Set methods.
-  - WeakMap and WeakSet (both release their entries), WeakRef and FinalizationRegistry.
-  - Promise, Proxy and Reflect.
-  - Typed arrays, DataView, TextEncoder and TextDecoder.
-- **Web extras:** `structuredClone`, `atob`, `btoa` and `queueMicrotask`.
-- **Not supported:** BigInt, Intl, and `eval` or `new Function` (code is never generated at run time). The full list of deviations is in [docs/engine.md](../docs/engine.md#not-supported-and-known-deviations).
+> **Status:** tested on host with ASan, UBSan, GC stress and out-of-memory injection, and tested in PPSSPP. **Real PSP-1000 hardware validation is still pending.**
 
-## Design in brief
+## ECMAScript support
 
-- **32-bit values:** 31-bit tagged integers, pointers, and special values. Numbers that aren't small integers are stored in 16-byte heap cells.
-- **Heap:** one fixed arena, allocated once. Running out is a catchable `InternalError`, never a crash.
-- **Garbage collector:** non-moving mark-sweep, with no reference counting and no C recursion while marking.
-- **Objects:** hidden classes (shapes), inline caches at property-access sites, and hashed indexes for large shapes.
-- **Compiler:** a single-pass compiler that emits compact bytecode.
-- **VM:** a stack VM in which JavaScript calls don't recurse on the C stack.
-- **Number handling for the PSP:** doubles are classified by their bit patterns, array indices are integers, and integer-to-string avoids `printf`. This keeps the soft-float cost down.
+PXJS targets **strict-mode ECMAScript 2023**.
 
-The full design, the benchmark against QuickJS and the list of limits are in [docs/engine.md](../docs/engine.md).
+Current Test262 baseline:
 
-## Using it
-
-```c
-#include "pxjs.h"
-
-PxConfig cfg;
-px_config_default(&cfg);
-cfg.heap_bytes = 6u << 20;               /* the whole JS heap, allocated once */
-PxVM *vm = px_new(&cfg);
-px_set_global_function(vm, "print", my_print, 1);
-if (px_eval(vm, src, len, "app.js", NULL) != 0)
-    fprintf(stderr, "%s\n", px_error_text(vm));
-while (px_has_jobs(vm)) px_run_jobs(vm); /* promise jobs */
-px_end_task(vm);
-px_free(vm);
+```text
+Applicable ES2023 tests: 34,460
+Passing:                 34,054
+Conformance:              98.8%
 ```
 
-The whole API is in [`include/pxjs.h`](include/pxjs.h). It covers:
+Deliberate exclusions such as sloppy mode, `eval`, BigInt, Intl, SharedArrayBuffer and unsupported module-graph behavior are classified separately and do not silently disappear from the test results.
 
-- values and conversions, objects and properties;
-- native functions, with bound data if needed;
-- handles for values kept across calls, and roots for values held while allocating;
-- modules with a host resolver, jobs, and promises for native async work;
-- a rejection tracker, an interrupt hook, and memory statistics.
-
-## Layout
-
-| Path | What |
-|---|---|
-| `include/pxjs.h` | the public API |
-| `src/` | the engine: heap (`px_heap.c`), objects, strings, lexer, compiler, VM, built-ins, JSON, iterators, promises, collections, Date, RegExp, typed arrays, async generators, Proxy, web extras, and the Unicode category table (generated by `tools/gen_unicode.py`) |
-| `tests/js/` | the test suite: one file per area, each run normally and under GC stress |
-| `tests/test262/` | the Test262 expectation files: every deviation, with its reason |
-| `tools/verify.sh` | every check in one run (below); `tools/test262.sh` runs Test262 alone |
-| `docs/` | [compatibility.md](docs/compatibility.md) (generated from Test262) and [engine-audit.md](docs/engine-audit.md) |
-| `tools/pxjs.c` | the command-line runner, with `--gc-stress`, `--heap KB`, `--stats` and `--disasm` |
-| `bench/` | micro-benchmarks, the QuickJS comparison runner, and the PSP benchmark EBOOT (`bench/psp/`) |
-| `bench/third_party/` | QuickJS, used **only** as a benchmark and behaviour reference (MIT) |
-
-## Build and test
-
-On any Linux machine with `make`, gcc with `-m32` support (`gcc-multilib`), `python3` and `git`, from `pxjs/`:
-
-```sh
-make && make test                     # the JS tests, normal and GC stress (ASan + UBSan)
-tools/verify.sh                       # everything: JS tests, number conversion, OOM injection, Test262,
-                                      #   docs/compatibility.md regenerated; a PASS/FAIL summary at the end
-tools/verify.sh --quick               # the same without Test262
-tools/test262.sh --only built-ins/Array   # part of Test262 (results in build/test262/)
-```
-
-Inside PSPX, the same runs in the pinned Docker images, launched from the repository root:
-
-```sh
-scripts/pxjs.sh test                  # all tests, normal and GC stress (ASan + UBSan)
-scripts/pxjs.sh run file.js           # run a script; print/assert/assertEq/gc/heapUsed/now are provided
-scripts/pxjs.sh run --disasm file.js  # show the bytecode
-scripts/test262.sh [--only ...]       # tools/test262.sh in the container
-scripts/verify.sh [--quick]           # tools/verify.sh in the container, then the PSPX runtime tests and PSP build
-scripts/bench-psp.sh                  # PXJS vs QuickJS inside PPSSPP
-```
-
-Build flags matter: host builds are 32-bit (`-m32`), because the value encoding assumes 32-bit pointers, and every build needs `-fno-strict-aliasing`.
-
-## License
-
-Apache License 2.0, like the rest of PSPX. See [LICENSE](../LICENSE) and [NOTICE](../NOTICE). `src/px_unicode.c` is derived from the Unicode Character Database; see [src/LICENSE-UNICODE.txt](src/LICENSE-UNICODE.txt).
+See [`docs/compatibility.md`](docs/compatibility.md) for the generated compatibility report and [`docs/engine-audit.md`](docs/engine-audit.md) for the full conformance audit.
