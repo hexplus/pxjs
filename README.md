@@ -8,7 +8,7 @@ PXJS currently passes **98.8% of its applicable ECMAScript 2023 Test262 baseline
 
 PXJS is a standalone C library with no dependencies beyond libc and libm. It builds for the PSP using PSPDEV and for 32-bit host systems for development and testing. PSPX embeds PXJS, but PXJS itself has no dependency on PSPX.
 
-> **Status:** PXJS is under active development. It is tested on host with ASan, UBSan, GC stress, out-of-memory injection, and the Test262 conformance suite, and has also been tested in PPSSPP. **Validation on real PSP-1000 hardware is still pending.**
+> **Status:** PXJS is under active development. It is tested on host with ASan, UBSan, GC stress, out-of-memory injection, and the Test262 conformance suite, in the PPSSPP emulator, and **on a real PSP-1000**.
 
 ## ECMAScript support
 
