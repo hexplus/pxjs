@@ -1,0 +1,81 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -68,7 +68,10 @@
+ 
+ /* define to include Atomics.* operations which depend on the OS
+    threads */
+-#if !defined(__EMSCRIPTEN__)
++/* PSPX: no Atomics on the PSP. There is no SharedArrayBuffer use case in a
++   single-JS-thread runtime, and newlib's pthread glue on the PSP is not
++   something the JS heap should depend on. */
++#if !defined(__EMSCRIPTEN__) && !defined(__psp__)
+ #define CONFIG_ATOMICS
+ #endif
+ 
+@@ -7556,8 +7559,13 @@
+             dbuf_printf(&dbuf, ":%d:%d", line_num, col_num);
+         dbuf_putc(&dbuf, '\n');
+         str = JS_NewString(ctx, filename);
+-        if (JS_IsException(str))
++        /* PSPX: free the partial backtrace on these out-of-memory exits
++           (after Tilefinch's oom-backtrace patch). Leaking it here trips
++           JS_FreeRuntime's leak assertion at exit. */
++        if (JS_IsException(str)) {
++            dbuf_free(&dbuf);
+             return;
++        }
+         /* Note: SpiderMonkey does that, could update once there is a standard */
+         if (JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_fileName, str,
+                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0 ||
+@@ -7565,6 +7573,7 @@
+                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0 ||
+             JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_columnNumber, JS_NewInt32(ctx, col_num),
+                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0) {
++            dbuf_free(&dbuf); /* PSPX: see above */
+             return;
+         }
+     }
+@@ -34154,6 +34163,9 @@
+             scope = get_u16(bc_buf + pos + 5);
+             pos_next = resolve_scope_var(ctx, s, var_name, scope, op, &bc_out,
+                                          NULL, NULL, pos_next);
++            /* A failed scope resolution is not a bytecode cursor. */
++            if (pos_next < 0)
++                goto fail;
+             JS_FreeAtom(ctx, var_name);
+             break;
+         case OP_scope_make_ref:
+@@ -34167,6 +34179,8 @@
+                 ls->ref_count--;  /* always remove label reference */
+                 pos_next = resolve_scope_var(ctx, s, var_name, scope, op, &bc_out,
+                                              bc_buf, ls, pos_next);
++                if (pos_next < 0)
++                    goto fail;
+                 JS_FreeAtom(ctx, var_name);
+             }
+             break;
+@@ -35914,6 +35928,12 @@
+     int closure_var_offset, vardefs_offset;
+     BOOL strip_var_debug;
+     
++    /* Parsing may have stopped between an opcode and its operands. */
++    if (dbuf_error(&fd->byte_code)) {
++        JS_ThrowOutOfMemory(ctx);
++        goto fail;
++    }
++
+     /* recompute scope linkage */
+     for (scope = 0; scope < fd->scope_count; scope++) {
+         fd->scopes[scope].first = -1;
+@@ -47251,7 +47271,10 @@
+         }
+     }
+     ti = time;
+-#if defined(_WIN32)
++/* PSPX: newlib's struct tm has no tm_gmtoff, so the PSP takes the portable
++   gmtime/mktime route. The runtime sets TZ from the console's own time zone
++   setting before any Date is created. */
++#if defined(_WIN32) || defined(__psp__)
+     {
+         struct tm *tm;
+         time_t gm_ti, loc_ti;

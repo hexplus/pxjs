@@ -1,0 +1,19 @@
+# Test262 expectations for promises, async functions and generators,
+# iterators and the keyed/weak collections (format: see expectations.txt).
+
+# These use BigInt literals but do not list the BigInt feature, so the
+# driver cannot tell by itself.
+UNSUPPORTED_DESIGN built-ins/Promise/all/resolve-throws-iterator-return-is-not-callable.js BigInt literals (BigInt is not implemented)
+UNSUPPORTED_DESIGN built-ins/Promise/allSettled/resolve-throws-iterator-return-is-not-callable.js BigInt literals (BigInt is not implemented)
+UNSUPPORTED_DESIGN built-ins/Promise/any/resolve-throws-iterator-return-is-not-callable.js BigInt literals (BigInt is not implemented)
+UNSUPPORTED_DESIGN built-ins/Promise/race/resolve-throws-iterator-return-is-not-callable.js BigInt literals (BigInt is not implemented)
+UNSUPPORTED_DESIGN built-ins/Iterator/prototype/Symbol.iterator/return-val.js BigInt literals (BigInt is not implemented)
+UNSUPPORTED_DESIGN built-ins/AsyncIteratorPrototype/Symbol.asyncIterator/return-val.js BigInt literals (BigInt is not implemented)
+
+# `eval` stands in for "a function that is not a constructor"; PXJS has no eval.
+UNSUPPORTED_DESIGN built-ins/Promise/all/ctx-non-ctor.js uses eval (no runtime code generation)
+UNSUPPORTED_DESIGN built-ins/Promise/allSettled/ctx-non-ctor.js uses eval (no runtime code generation)
+UNSUPPORTED_DESIGN built-ins/Promise/any/ctx-non-ctor.js uses eval (no runtime code generation)
+UNSUPPORTED_DESIGN built-ins/Promise/race/ctx-non-ctor.js uses eval (no runtime code generation)
+UNSUPPORTED_DESIGN built-ins/Promise/reject/ctx-non-ctor.js uses eval (no runtime code generation)
+UNSUPPORTED_DESIGN built-ins/Promise/resolve/ctx-non-ctor.js uses eval (no runtime code generation)

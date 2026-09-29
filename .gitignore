@@ -1,0 +1,6 @@
+# Build output
+build/
+/bench/psp/build/
+/tests/tmp/
+# Test262 checkout (scripts/test262.sh fetches the pinned commit)
+/third_party/test262/

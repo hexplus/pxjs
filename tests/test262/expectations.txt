@@ -1,0 +1,10 @@
+# Test262 expectations for PXJS (read by tools/test262.py).
+#
+# One entry per line:  CATEGORY  path-or-prefix-or-glob  reason
+#   EXPECTED_FAIL        a known bug or deviation, still to fix (the test runs;
+#                        if it starts passing the run reports UNEXPECTED_PASS)
+#   UNSUPPORTED_DESIGN   depends on something PXJS leaves out on purpose
+#   HARNESS_UNSUPPORTED  needs a host capability the runner does not have
+#   IRRELEVANT           not about the language PXJS implements
+# Every entry needs a reason. Features left out by design (BigInt, Intl,
+# shared memory, ...) are classified by tools/test262.py itself.

@@ -1,0 +1,20 @@
+# Test262 expectations for the typed arrays, ArrayBuffer, DataView and Date
+# (format: see expectations.txt).
+
+# These use BigInt but do not list the BigInt feature, so the driver cannot
+# tell by itself.
+UNSUPPORTED_DESIGN built-ins/TypedArray/prototype/toReversed/this-value-invalid.js BigInt literals (BigInt is not implemented)
+UNSUPPORTED_DESIGN built-ins/TypedArray/prototype/toSorted/this-value-invalid.js BigInt literals (BigInt is not implemented)
+UNSUPPORTED_DESIGN built-ins/TypedArray/prototype/toSorted/comparefn-not-a-function.js BigInt literals (BigInt is not implemented)
+UNSUPPORTED_DESIGN built-ins/TypedArrayConstructors/BigUint64Array/ BigUint64Array needs BigInt (not implemented)
+UNSUPPORTED_DESIGN built-ins/TypedArrayConstructors/BigInt64Array/ BigInt64Array needs BigInt (not implemented)
+UNSUPPORTED_DESIGN built-ins/DataView/prototype/getBigUint64/ DataView BigInt accessors need BigInt (not implemented)
+UNSUPPORTED_DESIGN built-ins/DataView/prototype/setBigUint64/ DataView BigInt accessors need BigInt (not implemented)
+UNSUPPORTED_DESIGN built-ins/DataView/prototype/getBigInt64/ DataView BigInt accessors need BigInt (not implemented)
+UNSUPPORTED_DESIGN built-ins/DataView/prototype/setBigInt64/ DataView BigInt accessors need BigInt (not implemented)
+
+# The VM makes a native constructor's `this` (reading NewTarget.prototype)
+# before the native runs, so a prototype getter runs before the argument
+# checks that the spec puts first (see construct_this in px_vm.c).
+EXPECTED_FAIL built-ins/DataView/byteOffset-validated-against-initial-buffer-length.js NewTarget.prototype is read before the offset check (px_vm.c construct_this)
+EXPECTED_FAIL built-ins/TypedArrayConstructors/ctors/typedarray-arg/throw-type-error-before-custom-proto-access.js NewTarget.prototype is read before ToIndex (px_vm.c construct_this)
