@@ -618,6 +618,7 @@ static PxValue proxy_revocable(PxVM *vm, PxValue t, int argc, PxValue *argv) {
         goto fail;
     }
     f = px_make_native_data(vm, revoke_fn, "", 0, p);
+    if (f != PX_EXCEPTION) ((PxObject *)px_ptr(f))->flags |= PX_OBJ_NOT_CTOR;
     if (f == PX_EXCEPTION || px_def_value(vm, o, "revoke", f, PX_ATTR_DEFAULT) < 0) {
         px_pop_roots(vm, 1);
         goto fail;

@@ -66,7 +66,7 @@ static int regex_allowed(int prev) {
     case T_IDENT: case T_NUMBER: case T_STRING: case T_TEMPLATE: case T_REGEXP:
     case T_RPAREN: case T_RBRACKET: case T_THIS: case T_TRUE: case T_FALSE: case T_NULL:
     case T_SUPER: case T_INC: case T_DEC: case T_OF: case T_GET: case T_SET: case T_STATIC:
-    case T_ASYNC: case T_AWAIT: case T_YIELD: case T_LET:
+    case T_ASYNC: case T_AWAIT: case T_YIELD: case T_LET: case T_PRIVATE:
         return 0;
     default: return 1;
     }
@@ -590,6 +590,10 @@ void lex_regex(Lexer *lx) {
         }
         {
             uint32_t cp = read_cp(lx, &size);
+            if (cp == 0x2028 || cp == 0x2029) {
+                error(lx, "unterminated regular expression");
+                return;
+            }
             lx->pos += size;
             if (!sbuf_put_cp(lx, &n, cp)) return;
         }

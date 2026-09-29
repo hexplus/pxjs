@@ -659,6 +659,10 @@ struct PxVM {
     PxValue proxy_proto; /* private: gives proxies a shape no other object has */
     PxValue  sym_fields; /* private symbol: a class's field initialiser */
     PxValue  sym_iterator; /* Symbol.iterator */
+    /* the original Array.prototype[Symbol.iterator] and array iterator
+     * next(): while they are in place, for-of and destructuring read
+     * arrays directly */
+    PxValue  array_values, array_iter_next;
     PxValue  sym_async_iterator;
     PxValue  sym_has_instance;
     PxValue  sym_to_primitive;
@@ -948,6 +952,7 @@ int     px_iterator_close_throw(PxVM *vm, PxValue iter);      /* keeps the pendi
 int     px_record_step(PxVM *vm, PxValue rec, PxValue *out);  /* px_iter_record's: 1 value, 0 done, -1 exc */
 int     px_def_tag(PxVM *vm, PxValue obj, const char *tag);   /* [Symbol.toStringTag] */
 int     px_def_species(PxVM *vm, PxValue ctor);               /* get [Symbol.species]() { return this } */
+int     px_symbol_registered(PxVM *vm, PxValue s);            /* made by Symbol.for: 1, 0, -1 exc */
 PxValue px_iter_result(PxVM *vm, PxValue value, int done);     /* { value, done } */
 PxValue px_make_iterobj(PxVM *vm, PxValue target, int kind);
 int     px_iter_init(PxVM *vm);

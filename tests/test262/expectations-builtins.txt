@@ -1,0 +1,44 @@
+# Test262 expectations for the object model and the core built-ins
+# (Object, Function, Array, String, Number, Math, JSON, Reflect, Proxy, ...).
+# Format: see expectations.txt.
+
+# These use BigInt or BigInt typed arrays without listing the feature.
+UNSUPPORTED_DESIGN built-ins/Array/prototype/toSorted/comparefn-not-a-function.js BigInt literals (BigInt is not implemented)
+UNSUPPORTED_DESIGN built-ins/Object/seal/seal-bigint64array.js BigInt64Array needs BigInt (not implemented)
+UNSUPPORTED_DESIGN built-ins/Object/seal/seal-biguint64array.js BigUint64Array needs BigInt (not implemented)
+
+# These build functions with the Function / GeneratorFunction / AsyncFunction
+# constructors, which need runtime code generation (left out by design).
+UNSUPPORTED_DESIGN built-ins/Function/S15.3_A2_T1.js the Function constructor compiles source at run time
+UNSUPPORTED_DESIGN built-ins/Function/S15.3_A2_T2.js the Function constructor compiles source at run time
+UNSUPPORTED_DESIGN built-ins/Function/prototype/toString/AsyncFunction.js the AsyncFunction constructor compiles source at run time
+UNSUPPORTED_DESIGN built-ins/Function/prototype/toString/AsyncGenerator.js the AsyncGeneratorFunction constructor compiles source at run time
+UNSUPPORTED_DESIGN built-ins/Function/prototype/toString/GeneratorFunction.js the GeneratorFunction constructor compiles source at run time
+UNSUPPORTED_DESIGN built-ins/Object/seal/seal-asyncarrowfunction.js the AsyncFunction constructor compiles source at run time
+UNSUPPORTED_DESIGN built-ins/Object/seal/seal-asyncfunction.js the AsyncFunction constructor compiles source at run time
+UNSUPPORTED_DESIGN built-ins/Object/seal/seal-asyncgeneratorfunction.js the AsyncGeneratorFunction constructor compiles source at run time
+UNSUPPORTED_DESIGN built-ins/Object/seal/seal-generatorfunction.js the GeneratorFunction constructor compiles source at run time
+
+# The global object has no `eval` (no runtime code generation).
+UNSUPPORTED_DESIGN built-ins/Object/getOwnPropertyDescriptor/15.2.3.3-4-4.js reads the global eval, which PXJS does not have
+UNSUPPORTED_DESIGN built-ins/Object/getOwnPropertyNames/15.2.3.4-4-1.js expects the global eval, which PXJS does not have
+
+# Unicode data PXJS does not ship (each table would cost tens of kB on the
+# PSP): canonical composition for normalize() and localeCompare(), the
+# special casing rules and case mapping outside the BMP tables.
+EXPECTED_FAIL built-ins/String/prototype/normalize/return-normalized-string.js no normalization tables: normalize() returns its input
+EXPECTED_FAIL built-ins/String/prototype/normalize/return-normalized-string-from-coerced-form.js no normalization tables: normalize() returns its input
+EXPECTED_FAIL built-ins/String/prototype/normalize/return-normalized-string-using-default-parameter.js no normalization tables: normalize() returns its input
+EXPECTED_FAIL built-ins/String/prototype/localeCompare/15.5.4.9_CE.js no normalization tables: canonically equivalent strings compare unequal
+EXPECTED_FAIL built-ins/String/prototype/toLowerCase/special_casing.js SpecialCasing.txt is not shipped
+EXPECTED_FAIL built-ins/String/prototype/toLowerCase/special_casing_conditional.js SpecialCasing.txt (final sigma) is not shipped
+EXPECTED_FAIL built-ins/String/prototype/toLowerCase/Final_Sigma_U180E.js SpecialCasing.txt (final sigma) is not shipped
+EXPECTED_FAIL built-ins/String/prototype/toLowerCase/supplementary_plane.js case mapping covers the BMP tables only
+EXPECTED_FAIL built-ins/String/prototype/toUpperCase/special_casing.js SpecialCasing.txt is not shipped
+EXPECTED_FAIL built-ins/String/prototype/toUpperCase/supplementary_plane.js case mapping covers the BMP tables only
+EXPECTED_FAIL built-ins/String/prototype/toLocaleLowerCase/special_casing.js SpecialCasing.txt is not shipped
+EXPECTED_FAIL built-ins/String/prototype/toLocaleLowerCase/special_casing_conditional.js SpecialCasing.txt (final sigma) is not shipped
+EXPECTED_FAIL built-ins/String/prototype/toLocaleLowerCase/Final_Sigma_U180E.js SpecialCasing.txt (final sigma) is not shipped
+EXPECTED_FAIL built-ins/String/prototype/toLocaleLowerCase/supplementary_plane.js case mapping covers the BMP tables only
+EXPECTED_FAIL built-ins/String/prototype/toLocaleUpperCase/special_casing.js SpecialCasing.txt is not shipped
+EXPECTED_FAIL built-ins/String/prototype/toLocaleUpperCase/supplementary_plane.js case mapping covers the BMP tables only

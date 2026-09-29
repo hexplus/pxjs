@@ -170,6 +170,10 @@ int main(int argc, char **argv) {
     PxValue  r, g;
 
     px_config_default(&cfg);
+    /* Some tests build multi-megabyte strings (the generated Unicode
+     * property tests do); conformance, not the PSP's memory, is measured
+     * here. */
+    cfg.heap_bytes = 64u << 20;
     for (i = 1; i < argc && strcmp(argv[i], "--") != 0 && argv[i][0] == '-' && argv[i][1] == '-'; i++) {
         if (strcmp(argv[i], "--strict") == 0) strict = 1;
         else if (strcmp(argv[i], "--module") == 0) module = 1;

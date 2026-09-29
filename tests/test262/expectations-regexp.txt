@@ -1,0 +1,22 @@
+# Test262 expectations of the regexp contributor (format: expectations.txt).
+EXPECTED_FAIL built-ins/RegExp/property-escapes/generated/[A-Z]*.js each test builds strings of up to all 1.1M code points (over 4 MB in UTF-16), more than test262_host's default 4 MB heap: all 441 pass with a 64 MB heap
+EXPECTED_FAIL built-ins/RegExp/CharacterClassEscapes/ each test also compiles its pattern with the ES2024 v flag (not implemented), and builds a 4.4 MB string of every code point
+EXPECTED_FAIL built-ins/RegExp/prototype/dotAll/this-val-non-obj.js the test also calls the getter on a BigInt literal (left out by design), which is a parse error for the whole file
+EXPECTED_FAIL built-ins/RegExp/prototype/flags/this-val-non-obj.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL built-ins/RegExp/prototype/global/this-val-non-obj.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL built-ins/RegExp/prototype/hasIndices/this-val-non-obj.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL built-ins/RegExp/prototype/ignoreCase/this-val-non-obj.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL built-ins/RegExp/prototype/multiline/this-val-non-obj.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL built-ins/RegExp/prototype/source/this-val-non-obj.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL built-ins/RegExp/prototype/sticky/this-val-non-obj.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL built-ins/RegExp/prototype/unicode/this-val-non-obj.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL built-ins/String/prototype/match/cstm-matcher-on-bigint-primitive.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL built-ins/String/prototype/matchAll/cstm-matchall-on-bigint-primitive.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL built-ins/String/prototype/replace/cstm-replace-on-bigint-primitive.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL built-ins/String/prototype/replaceAll/cstm-replaceall-on-bigint-primitive.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL built-ins/String/prototype/search/cstm-search-on-bigint-primitive.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL built-ins/String/prototype/split/cstm-split-on-bigint-primitive.js the test contains a BigInt literal (left out by design)
+EXPECTED_FAIL language/literals/regexp/regexp-first-char-no-line-separator.js the lexer (compiler area) accepts U+2028 inside a regular expression literal
+EXPECTED_FAIL language/literals/regexp/regexp-first-char-no-paragraph-separator.js the lexer (compiler area) accepts U+2029 inside a regular expression literal
+EXPECTED_FAIL language/literals/regexp/regexp-source-char-no-line-separator.js the lexer (compiler area) accepts U+2028 inside a regular expression literal
+EXPECTED_FAIL language/literals/regexp/regexp-source-char-no-paragraph-separator.js the lexer (compiler area) accepts U+2029 inside a regular expression literal

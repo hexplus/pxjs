@@ -257,7 +257,7 @@ def classify(args, rules, rel):
     body = FRONT.sub("", text)
     body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
     body = re.sub(r"//[^\n]*", "", body)
-    uses_eval = bool(re.search(r"\beval\s*\(|\bFunction\s*\(|\bindirectEval\b|\.constructor\s*\(\s*['\"`]", body))
+    uses_eval = bool(re.search(r"\beval\s*[()]|\bFunction\s*\(|\bindirectEval\b|\.constructor\s*\(\s*['\"`]", body))
 
     is_async = "async" in flags
     harness = os.path.join(args.test262, "harness")

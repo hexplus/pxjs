@@ -3723,6 +3723,15 @@ static PxValue symp_to_primitive(PxVM *vm, PxValue t, int argc, PxValue *argv) {
     return px_throw_error(vm, PX_TYPE_ERROR, "Symbol.prototype[Symbol.toPrimitive] called on a non-symbol");
 }
 
+/* dst[name] = src[of]: one function object under two names (trimLeft,
+ * Number.parseFloat...), a method's attributes. */
+static int def_alias(PxVM *vm, PxValue dst, const char *name, PxValue src, const char *of) {
+    PxValue k = px_intern_cstr(vm, of), f;
+    if (k == PX_EXCEPTION) return -1;
+    f = px_get(vm, src, k);
+    return f == PX_EXCEPTION ? -1 : px_def_value(vm, dst, name, f, PX_ATTR_HIDDEN);
+}
+
 /* A well-known symbol px_iter.c does not make: Symbol[name], in *slot. */
 static int def_well_known(PxVM *vm, PxValue *slot, const char *name) {
     char    buf[40];
@@ -3800,11 +3809,13 @@ int px_builtins_init(PxVM *vm) {
     TRY(px_def_fns(vm, vm->ctors[PX_PROTO_STRING], k_string_fns, PX_COUNTOF(k_string_fns)));
     TRY(px_def_fns(vm, vm->protos[PX_PROTO_STRING], k_string_proto_fns, PX_COUNTOF(k_string_proto_fns)));
     TRY(px_def_fns(vm, vm->protos[PX_PROTO_STRING], k_extra_string_proto_fns, PX_COUNTOF(k_extra_string_proto_fns)));
+    TRY(def_alias(vm, vm->protos[PX_PROTO_STRING], "trimLeft", vm->protos[PX_PROTO_STRING], "trimStart"));
+    TRY(def_alias(vm, vm->protos[PX_PROTO_STRING], "trimRight", vm->protos[PX_PROTO_STRING], "trimEnd"));
 
     {
         static const PxFnDef num_fns[] = {
             {"isInteger", num_is, 1, 0}, {"isSafeInteger", num_is, 1, 1}, {"isFinite", num_is, 1, 2},
-            {"isNaN", num_is, 1, 3},     {"parseFloat", g_parse_float, 1, 0}, {"parseInt", g_parse_int, 2, 0},
+            {"isNaN", num_is, 1, 3},
         };
         static const PxFnDef nump_fns[] = {
             {"toString", nump_to_string, 1, 0}, {"toLocaleString", nump_to_string, 0, 0},
@@ -3872,6 +3883,9 @@ int px_builtins_init(PxVM *vm) {
         }
     }
     TRY(px_def_fns(vm, vm->global, k_global_fns, PX_COUNTOF(k_global_fns)));
+    /* Number.parseFloat and Number.parseInt are the global functions themselves */
+    TRY(def_alias(vm, vm->ctors[PX_PROTO_NUMBER], "parseFloat", vm->global, "parseFloat"));
+    TRY(def_alias(vm, vm->ctors[PX_PROTO_NUMBER], "parseInt", vm->global, "parseInt"));
     {
         PxObject *r = px_obj_new(vm, PX_T_OBJECT, sizeof(PxObject), vm->protos[PX_PROTO_OBJECT]);
         PxValue   rv;

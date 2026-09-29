@@ -96,6 +96,16 @@ static PxValue symbol_key_for(PxVM *vm, PxValue t, int argc, PxValue *argv) {
     return found == s ? ((PxSymbol *)px_ptr(s))->description : PX_UNDEFINED;
 }
 
+/* 1 if Symbol.for made s (such a symbol cannot be held weakly), 0 if
+ * not, -1 on an exception */
+int px_symbol_registered(PxVM *vm, PxValue s) {
+    PxValue r;
+    PX_ROOT(vm, s);
+    r = symbol_key_for(vm, PX_UNDEFINED, 1, &s);
+    px_pop_roots(vm, 1);
+    return r == PX_EXCEPTION ? -1 : r != PX_UNDEFINED;
+}
+
 static PxValue this_symbol(PxVM *vm, PxValue t) {
     if (px_is_ptr(t) && px_type_of(t) == PX_T_SYMBOL) return t;
     if (px_is_obj(t) && px_type_of(t) == PX_T_BOXED) {
@@ -689,7 +699,7 @@ int px_iter_init(PxVM *vm) {
     vm->sym_fields = px_symbol_new(vm, desc);
     if (vm->sym_fields == PX_EXCEPTION) return -1;
     ((PxSymbol *)px_ptr(vm->sym_fields))->is_private = 1;
-    getter = px_make_native(vm, symbolp_description, "description", 0, 0);
+    getter = px_make_native(vm, symbolp_description, "get description", 0, 0);
     if (getter == PX_EXCEPTION) return -1;
     {
         PxValue k = px_intern_cstr(vm, "description");
@@ -711,6 +721,7 @@ int px_iter_init(PxVM *vm) {
         if (f == PX_EXCEPTION || px_define(vm, p, vm->atom[PX_ATOM_next], f, PX_ATTR_HIDDEN) < 0 ||
             px_def_tag(vm, p, iter_kinds[i].tag) < 0)
             return -1;
+        if (iter_kinds[i].proto == PX_PROTO_ARRAY_ITERATOR) vm->array_iter_next = f;
     }
     /* generators, and the prototypes of generator and async functions */
     if (px_set_proto(vm, vm->protos[PX_PROTO_GENOBJ], vm->protos[PX_PROTO_ITERATOR]) < 0 ||
@@ -725,8 +736,10 @@ int px_iter_init(PxVM *vm) {
     f = px_get(vm, vm->protos[PX_PROTO_ARRAY], px_intern_cstr(vm, "values"));
     if (f == PX_EXCEPTION || px_define(vm, vm->protos[PX_PROTO_ARRAY], vm->sym_iterator, f, PX_ATTR_HIDDEN) < 0)
         return -1;
+    vm->array_values = f;
     f = px_make_native(vm, make_array_iterator, "[Symbol.iterator]", 0, PX_IT_STRING);
-    if (f == PX_EXCEPTION || px_define(vm, vm->protos[PX_PROTO_STRING], vm->sym_iterator, f, PX_ATTR_HIDDEN) < 0)
-        return -1;
+    if (f == PX_EXCEPTION) return -1;
+    ((PxObject *)px_ptr(f))->flags |= PX_OBJ_NOT_CTOR;
+    if (px_define(vm, vm->protos[PX_PROTO_STRING], vm->sym_iterator, f, PX_ATTR_HIDDEN) < 0) return -1;
     return 0;
 }

@@ -575,6 +575,8 @@ static void mark_roots(PxVM *vm) {
     px_mark_value(vm, vm->proxy_proto);
     px_mark_value(vm, vm->sym_fields);
     px_mark_value(vm, vm->sym_iterator);
+    px_mark_value(vm, vm->array_values);
+    px_mark_value(vm, vm->array_iter_next);
     px_mark_value(vm, vm->sym_async_iterator);
     px_mark_value(vm, vm->sym_has_instance);
     px_mark_value(vm, vm->sym_to_primitive);

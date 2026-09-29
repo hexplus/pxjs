@@ -143,6 +143,32 @@ main().then(r => print("async ok", r), e => { print("async FAILED", e); throw e;
     assertEq(Object.getPrototypeOf(setIt).next.call(done), { value: undefined, done: true });
 })();
 
+// Collections: constructors go through set/add, brand checks, symbol weak keys.
+(function () {
+    const seen = [];
+    class LoggingMap extends Map { set(k, v) { seen.push(k); return super.set(k, v); } }
+    const lm = new LoggingMap([[1, "a"], [2, "b"]]);
+    assertEq(seen, [1, 2]);
+    assert(lm instanceof LoggingMap && lm.get(2) === "b", "subclass construction");
+    let err;
+    try { Map(); } catch (e) { err = e; }
+    assert(err instanceof TypeError, "Map needs new");
+    try { Map.prototype.get.call(new Set(), 1); err = null; } catch (e) { err = e; }
+    assert(err instanceof TypeError, "Map methods reject a Set");
+    let closed = 0;
+    const items = { [Symbol.iterator]() { return { next: () => ({ done: false, value: 1 }), return() { closed++; return {}; } }; } };
+    try { new Map(items); err = null; } catch (e) { err = e; }
+    assert(err instanceof TypeError && closed === 1, "a bad entry closes the iterator");
+    const sym = Symbol("weak"), wm = new WeakMap([[sym, 1]]);
+    assertEq(wm.get(sym), 1);
+    try { wm.set(Symbol.for("registered"), 1); err = null; } catch (e) { err = e; }
+    assert(err instanceof TypeError, "a registered symbol cannot be held weakly");
+    assertEq(new WeakRef(sym).deref(), sym);
+    assert(Set.prototype.keys === Set.prototype.values, "Set keys is values");
+    assertEq(Object.prototype.toString.call(new WeakSet()), "[object WeakSet]");
+    assertEq(Map[Symbol.species], Map);
+})();
+
 async function asyncConformance() {
     // yield* in async generators, over async and sync iterables
     async function* inner() { yield 1; yield 2; return "inner done"; }

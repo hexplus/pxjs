@@ -2,5 +2,7 @@
 build/
 /bench/psp/build/
 /tests/tmp/
-# Test262 checkout (scripts/test262.sh fetches the pinned commit)
+# Test262 checkout (tools/test262.sh fetches the pinned commit)
 /third_party/test262/
+# Python bytecode of the tools
+__pycache__/

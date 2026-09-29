@@ -616,6 +616,45 @@ fail:
 
 static PxValue run(PxVM *vm, uint32_t entry, int throw_now);
 
+/* SetFunctionName for a method with a computed key (the compiler names the
+ * others): "[description]" for a symbol, and "get "/"set " in front for an
+ * accessor. An own `name` property over the one the function computes. */
+static int set_computed_name(PxVM *vm, PxValue fn, PxValue key, int mk) {
+    PxValue n, p;
+    int     r;
+    if (px_type_of(fn) != PX_T_CLOSURE) return 0;
+    PX_ROOT(vm, fn);
+    PX_ROOT(vm, key);
+    /* every string is rooted while the next one is allocated */
+    if (px_is_ptr(key) && px_type_of(key) == PX_T_SYMBOL) {
+        PxValue d = ((PxSymbol *)px_ptr(key))->description;
+        if (d == PX_UNDEFINED) n = vm->atom[PX_ATOM_empty];
+        else {
+            PX_ROOT(vm, d);
+            p = px_str_from_cstr(vm, "[");
+            PX_ROOT(vm, p);
+            n = p == PX_EXCEPTION ? p : px_str_concat(vm, p, d);
+            PX_ROOT(vm, n);
+            p = n == PX_EXCEPTION ? n : px_str_from_cstr(vm, "]");
+            PX_ROOT(vm, p);
+            n = p == PX_EXCEPTION ? p : px_str_concat(vm, n, p);
+            px_pop_roots(vm, 4);
+        }
+    } else {
+        n = px_key_to_value(vm, key);
+    }
+    if (n != PX_EXCEPTION && mk != PX_MK_METHOD) {
+        PX_ROOT(vm, n);
+        p = px_str_from_cstr(vm, mk == PX_MK_GET ? "get " : "set ");
+        PX_ROOT(vm, p);
+        n = p == PX_EXCEPTION ? p : px_str_concat(vm, p, n);
+        px_pop_roots(vm, 2);
+    }
+    r = n == PX_EXCEPTION ? -1 : px_define(vm, fn, vm->atom[PX_ATOM_name], n, PX_ATTR_CONFIGURABLE);
+    px_pop_roots(vm, 2);
+    return r < 0 ? -1 : 0;
+}
+
 PxValue px_gen_resume(PxVM *vm, PxGen *g, PxValue v, int mode, int *done) {
     PxValue *seg = vm->sp, r;
     PxFrame *f;
@@ -712,6 +751,7 @@ void px_async_step(PxVM *vm, PxGen *g, PxValue v, int mode) {
     PxValue gv = px_from_ptr(g), r, p, onf, onr;
     int     done;
     PX_ROOT(vm, gv);
+resume:
     r = px_gen_resume(vm, g, v, mode, &done);
     if (r == PX_EXCEPTION) {
         if (!vm->uncatchable) {
@@ -745,12 +785,17 @@ void px_async_step(PxVM *vm, PxGen *g, PxValue v, int mode) {
 fail2:
     px_pop_roots(vm, 1);
 fail:
-    px_pop_roots(vm, 2);
-    if (!vm->uncatchable) {
-        PxValue exc   = vm->exception;
-        vm->exception = PX_UNDEFINED;
-        px_promise_reject(vm, g->promise, exc);
+    px_pop_roots(vm, 1);
+    if (vm->uncatchable) {
+        px_pop_roots(vm, 1);
+        return;
     }
+    /* Await itself threw (PromiseResolve reads a promise's `constructor`):
+     * the exception is thrown at the await */
+    v             = vm->exception;
+    vm->exception = PX_UNDEFINED;
+    mode          = PX_RESUME_THROW;
+    goto resume;
 }
 
 /* A call to a generator or async function: the frame has been pushed;
@@ -1053,6 +1098,18 @@ fail:
     return PX_EXCEPTION;
 }
 
+/* Would iterating array a run the original array iterator? (Then it can
+ * be read directly.) */
+static int array_iteration_intact(PxVM *vm, PxObject *a) {
+    PxObject *ap = (PxObject *)px_ptr(vm->protos[PX_PROTO_ARRAY]);
+    PxValue  *s;
+    if (a->shape->proto != ap || px_own_slot(vm, a, vm->sym_iterator, NULL)) return 0;
+    s = px_own_slot(vm, ap, vm->sym_iterator, NULL);
+    if (!s || *s != vm->array_values) return 0;
+    s = px_own_slot(vm, (PxObject *)px_ptr(vm->protos[PX_PROTO_ARRAY_ITERATOR]), vm->atom[PX_ATOM_next], NULL);
+    return s && *s == vm->array_iter_next;
+}
+
 /* for-of / spread / destructuring source: arrays and strings directly,
  * everything else through [Symbol.iterator]. */
 static PxValue make_values_iter(PxVM *vm, PxValue target) {
@@ -1061,7 +1118,7 @@ static PxValue make_values_iter(PxVM *vm, PxValue target) {
         it = iter_alloc(vm, PX_ITK_STRING, target);
         return it ? px_from_ptr(it) : PX_EXCEPTION;
     }
-    if (px_is_obj(target) && px_type_of(target) == PX_T_ARRAY) {
+    if (px_is_obj(target) && px_type_of(target) == PX_T_ARRAY && array_iteration_intact(vm, (PxObject *)px_ptr(target))) {
         it = iter_alloc(vm, PX_ITK_ARRAY, target);
         return it ? px_from_ptr(it) : PX_EXCEPTION;
     }
@@ -1650,6 +1707,14 @@ static PxValue run(PxVM *vm, uint32_t entry, int throw_now) {
             break;
         }
         case OP_CLOSE_UPVALS: close_upvals(vm, f->base + READ_U8()); break;
+        case OP_THROW_REF: {
+            char    msg[160];
+            PxValue m = CONSTS[READ_U16()];
+            SAVE();
+            px_str_to_utf8(vm, m, msg, sizeof msg);
+            px_throw_error(vm, PX_REFERENCE_ERROR, "%s", msg);
+            THROW();
+        }
         case OP_THROW_CONST: {
             char    name[64];
             PxValue n = CONSTS[READ_U16()];
@@ -1689,8 +1754,13 @@ static PxValue run(PxVM *vm, uint32_t entry, int throw_now) {
         case OP_DEF_GLOBAL: {
             PxValue name = CONSTS[READ_U16()], v = TOP();
             SAVE();
-            if (v != PX_UNDEFINED || !px_has_own(vm, vm->global, name))
+            /* a new global var/function is defined (writable, enumerable,
+             * not configurable), not set: no setter up the chain runs */
+            if (!px_has_own(vm, vm->global, name)) {
+                if (px_define(vm, vm->global, name, v, PX_ATTR_WRITABLE | PX_ATTR_ENUMERABLE) < 0) THROW();
+            } else if (v != PX_UNDEFINED) {
                 if (px_set(vm, vm->global, name, v) < 0) THROW();
+            }
             sp--;
             break;
         }
@@ -1859,6 +1929,7 @@ static PxValue run(PxVM *vm, uint32_t entry, int throw_now) {
             }
             SAVE();
             if (px_type_of(fn) == PX_T_CLOSURE) ((PxClosure *)px_ptr(fn))->home = obj;
+            if (op == OP_DEFINE_METHOD_ELEM && set_computed_name(vm, fn, key, kind & 3) < 0) THROW();
             attrs = PX_ATTR_CONFIGURABLE | ((kind & PX_MK_ENUM) ? PX_ATTR_ENUMERABLE : 0);
             switch (kind & 3) {
             case PX_MK_GET: r = px_define_accessor(vm, obj, key, fn, PX_UNDEFINED, attrs); break;
@@ -1994,6 +2065,53 @@ static PxValue run(PxVM *vm, uint32_t entry, int throw_now) {
                 CHECK(v);
             }
             PUSH(v);
+            break;
+        }
+        case OP_GET_SUPER_RECV:
+        case OP_GET_SUPER_ELEM_RECV:
+        case OP_SET_SUPER:
+        case OP_SET_SUPER_ELEM: {
+            /* a super reference: base home.[[GetPrototypeOf]](), the this
+             * value below the key and value (if any) as the receiver */
+            PxValue  home = f->fn->home, base, key, v, r;
+            int      set  = op == OP_SET_SUPER || op == OP_SET_SUPER_ELEM;
+            int      nin  = op == OP_GET_SUPER_RECV ? 1 : op == OP_SET_SUPER_ELEM ? 3 : 2;
+            PxValue *in   = sp - nin;
+            SAVE();
+            if (op == OP_GET_SUPER_RECV || op == OP_SET_SUPER) {
+                key = CONSTS[READ_U16()];
+            } else {
+                key = key_of(vm, in[1]);
+                CHECK(key);
+                in[1] = key;
+            }
+            SAVE();
+            if (!px_is_obj(home)) {
+                px_throw_error(vm, PX_SYNTAX_ERROR, "'super' keyword unexpected here");
+                THROW();
+            }
+            base = px_proto_of(vm, home);
+            if (!px_is_obj(base)) {
+                px_throw_error(vm, PX_TYPE_ERROR, "cannot %s a property of super: the prototype is null",
+                               set ? "set" : "read");
+                THROW();
+            }
+            if (set) {
+                int ok;
+                v  = sp[-1];
+                ok = px_set_recv(vm, base, key, v, in[0]);
+                if (ok < 0) THROW();
+                if (ok == 0) {
+                    px_throw_error(vm, PX_TYPE_ERROR, "cannot assign to a property through super");
+                    THROW();
+                }
+                r = v;
+            } else {
+                r = px_get_recv(vm, base, key, in[0]);
+                CHECK(r);
+            }
+            sp     = in + 1;
+            sp[-1] = r;
             break;
         }
         case OP_SUPER_CALL:
@@ -2762,6 +2880,18 @@ static PxValue run(PxVM *vm, uint32_t entry, int throw_now) {
             sp[-2] = sp[-1];
             sp--;
             break;
+        case OP_ELEM_KEY: {
+            PxValue k;
+            SAVE();
+            if (sp[-2] == PX_NULL || sp[-2] == PX_UNDEFINED) {
+                px_throw_error(vm, PX_TYPE_ERROR, "cannot read properties of %s", sp[-2] == PX_NULL ? "null" : "undefined");
+                THROW();
+            }
+            k = key_of(vm, TOP());
+            CHECK(k);
+            TOP() = k;
+            break;
+        }
         case OP_TO_PROPKEY: {
             PxValue k;
             SAVE();

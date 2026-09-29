@@ -129,6 +129,10 @@ typedef struct FuncState {
     int               ctx;           /* CTX_*: what the code may contain */
     int               var_floor;     /* locals from here up belong to nested blocks */
     int               length;        /* the function's `length` */
+    /* while a parameter's default or pattern is compiled: the locals not
+     * initialised yet (later parameters, and the names their patterns
+     * bind), read as a ReferenceError */
+    int               tdz_lo, tdz_hi, tdz_lo2, tdz_hi2;
 } FuncState;
 
 /* What a function's code may contain, for early errors. Arrows inherit
@@ -175,6 +179,7 @@ typedef struct Compiler {
     int param_floor1; /* 1 + the first parameter the next block_begin checks lexical names against */
     int unary_op;     /* the last unary() read an operator (-x, typeof x...): not a ** base */
     int private_in;   /* primary() read `#x` (which must be followed by `in`) */
+    struct Decls *exports, *export_locals; /* a module's exported names; the locals `export {x}` names */
     PxValue atom_arguments, atom_eval; /* names strict code may not bind */
 } Compiler;
 
@@ -219,7 +224,11 @@ static void skip_add(struct SkipTab *t, uint32_t pos, LexState after, int flags)
     t->n++;
 }
 
-typedef enum { E_VOID = 0, E_VALUE, E_LOCAL, E_UPVAL, E_GLOBAL, E_MEMBER, E_INDEX } EKind;
+/* E_SUPER_MEMBER / E_SUPER_INDEX: super.x / super[k], with `this` (and the
+ * key) on the stack where E_MEMBER / E_INDEX have the object (and key) */
+typedef enum { E_VOID = 0, E_VALUE, E_LOCAL, E_UPVAL, E_GLOBAL, E_MEMBER, E_INDEX, E_SUPER_MEMBER, E_SUPER_INDEX } EKind;
+#define MEMBER_LIKE(k) ((k) == E_MEMBER || (k) == E_SUPER_MEMBER)
+#define INDEX_LIKE(k)  ((k) == E_INDEX || (k) == E_SUPER_INDEX)
 
 typedef struct Exp {
     EKind   k;
@@ -759,6 +768,19 @@ static int find_local(FuncState *fs, PxValue name) {
     return -1;
 }
 
+/* THROW_REF with a message; its %s is name (0: nothing) */
+static void emit_throw_ref(Compiler *C, const char *fmt, PxValue name) {
+    char    buf[160], nm[64] = "";
+    PxValue m;
+    if (name) px_str_to_utf8(C->vm, name, nm, sizeof nm);
+    snprintf(buf, sizeof buf, fmt, nm);
+    m = px_str_from_cstr(C->vm, buf);
+    check_alloc(C, m != PX_EXCEPTION);
+    PX_ROOT(C->vm, m);
+    emit_op_u16(C, OP_THROW_REF, add_const(C, m));
+    px_pop_roots(C->vm, 1);
+}
+
 static int declare_local(Compiler *C, PxValue name, int kind) {
     FuncState *fs = C->fs;
     if (fs->nactive >= MAX_LOCALS) fail(C, "RangeError: too many local variables in one function");
@@ -840,11 +862,18 @@ static int needs_tdz(Compiler *C, const Exp *e) { return IS_LEXICAL(e->kind) && 
 
 static void discharge(Compiler *C, Exp *e) {
     switch (e->k) {
-    case E_LOCAL: emit_op_u8(C, needs_tdz(C, e) ? OP_GET_LOCAL_CHECK : OP_GET_LOCAL, e->idx); break;
+    case E_LOCAL:
+        if ((e->idx >= C->fs->tdz_lo && e->idx < C->fs->tdz_hi) || (e->idx >= C->fs->tdz_lo2 && e->idx < C->fs->tdz_hi2))
+            emit_throw_ref(C, "'%s' is used before its initialisation", e->name);
+        else
+            emit_op_u8(C, needs_tdz(C, e) ? OP_GET_LOCAL_CHECK : OP_GET_LOCAL, e->idx);
+        break;
     case E_UPVAL: emit_op_u8(C, IS_LEXICAL(e->kind) ? OP_GET_UPVAL_CHECK : OP_GET_UPVAL, e->idx); break;
     case E_GLOBAL: emit_op_u16(C, OP_GET_GLOBAL, e->idx); break;
     case E_MEMBER: emit_prop(C, OP_GET_PROP, e->idx); break;
     case E_INDEX: emit_op(C, e->priv ? OP_GET_PRIVATE : OP_GET_ELEM); break;
+    case E_SUPER_MEMBER: emit_op_u16(C, OP_GET_SUPER_RECV, e->idx); break;
+    case E_SUPER_INDEX: emit_op(C, OP_GET_SUPER_ELEM_RECV); break;
     case E_VOID: emit_op(C, OP_UNDEF); break;
     case E_VALUE: break;
     }
@@ -866,6 +895,8 @@ static void store(Compiler *C, Exp *e) {
     case E_GLOBAL: emit_op_u16(C, OP_SET_GLOBAL, e->idx); break;
     case E_MEMBER: emit_prop(C, OP_SET_PROP, e->idx); break;
     case E_INDEX: emit_op(C, e->priv ? OP_SET_PRIVATE : OP_SET_ELEM); break;
+    case E_SUPER_MEMBER: emit_op_u16(C, OP_SET_SUPER, e->idx); break;
+    case E_SUPER_INDEX: emit_op(C, OP_SET_SUPER_ELEM); break;
     default: fail(C, "SyntaxError: invalid assignment target");
     }
     e->k = E_VALUE;
@@ -886,8 +917,14 @@ static void check_target(Compiler *C, const Exp *e, const char *what) {
  * MEMBER keeps its object, INDEX its object and key. */
 static void load_keep(Compiler *C, Exp *e) {
     Exp t = *e;
-    if (e->k == E_MEMBER) emit_op(C, OP_DUP);
-    else if (e->k == E_INDEX) emit_op(C, OP_DUP2);
+    if (MEMBER_LIKE(e->k)) emit_op(C, OP_DUP);
+    else if (e->k == E_INDEX) {
+        if (!e->priv) emit_op(C, OP_ELEM_KEY); /* the key converted once, for the load and the store */
+        emit_op(C, OP_DUP2);
+    } else if (e->k == E_SUPER_INDEX) {
+        emit_op(C, OP_TO_PROPKEY);
+        emit_op(C, OP_DUP2);
+    }
     discharge(C, &t);
 }
 
@@ -1212,6 +1249,7 @@ static void array_literal(Compiler *C) {
 static PxValue property_key(Compiler *C, int *plain_name) {
     PxValue key = 0;
     if (plain_name) *plain_name = 0;
+    if (TOK == T_PRIVATE && plain_name) unexpected(C); /* only class members have private names */
     if (TOK == T_PRIVATE) {
         /* #name: the key is the class's private symbol, a local */
         Exp e;
@@ -1407,8 +1445,11 @@ static void super_expr(Compiler *C, Exp *e) {
             emit_op_u16(C, OP_GET_SUPER, add_const(C, key));
             argc = arguments(C);
             emit_call(C, argc);
-        } else {
-            emit_op_u16(C, OP_GET_SUPER, add_const(C, key));
+        } else { /* a reference: read, assigned or deleted by the caller */
+            emit_this(C);
+            e->k    = E_SUPER_MEMBER;
+            e->idx  = add_const(C, key);
+            e->priv = 0;
         }
         return;
     }
@@ -1421,11 +1462,16 @@ static void super_expr(Compiler *C, Exp *e) {
             expect(C, T_RBRACKET);
             is_call = TOK == T_LPAREN;
             lex_restore(&C->lx, st);
-            if (is_call) emit_this(C);
+            emit_this(C);
             expr(C);
             expect(C, T_RBRACKET);
-            emit_op(C, OP_GET_SUPER_ELEM);
-            if (is_call) emit_call(C, arguments(C));
+            if (is_call) {
+                emit_op(C, OP_GET_SUPER_ELEM);
+                emit_call(C, arguments(C));
+            } else {
+                e->k    = E_SUPER_INDEX;
+                e->priv = 0;
+            }
         }
         return;
     }
@@ -1577,24 +1623,28 @@ static void primary(Compiler *C, Exp *e) {
 /* Short-circuit targets of a ?. chain, by how many values were on the
  * stack for the chain when it jumped (1: the object, 2: this+function). */
 typedef struct Chain {
-    IntList one, two;
+    int jumps[2][32]; /* [0]: one value, [1]: two (fixed: no heap memory to lose on a syntax error) */
+    int n[2];
 } Chain;
+
+static void chain_add(Compiler *C, Chain *ch, int two, int at) {
+    if (ch->n[two] >= 32) fail(C, "SyntaxError: optional chain too long");
+    ch->jumps[two][ch->n[two]++] = at;
+}
 
 static void chain_end(Compiler *C, Exp *e, Chain *ch) {
     int i, jend, depth;
-    if (ch->one.n == 0 && ch->two.n == 0) return;
+    if (ch->n[0] == 0 && ch->n[1] == 0) return;
     discharge(C, e);
     depth = C->fs->stack;
     jend  = emit_jump(C, OP_JUMP);
-    for (i = 0; i < ch->two.n; i++) patch_here(C, ch->two.v[i]);
-    if (ch->two.n) emit_op(C, OP_POP);
-    for (i = 0; i < ch->one.n; i++) patch_here(C, ch->one.v[i]);
+    for (i = 0; i < ch->n[1]; i++) patch_here(C, ch->jumps[1][i]);
+    if (ch->n[1]) emit_op(C, OP_POP);
+    for (i = 0; i < ch->n[0]; i++) patch_here(C, ch->jumps[0][i]);
     emit_op(C, OP_POP);
     emit_op(C, OP_UNDEF);
     patch_here(C, jend);
     C->fs->stack = depth;
-    free(ch->one.v);
-    free(ch->two.v);
     e->k = E_VALUE;
 }
 
@@ -1603,6 +1653,15 @@ static void call_setup(Compiler *C, Exp *e) {
     switch (e->k) {
     case E_MEMBER: emit_prop(C, OP_GET_PROP_KEEP, e->idx); break;
     case E_INDEX: emit_op(C, e->priv ? OP_GET_PRIVATE_KEEP : OP_GET_ELEM_KEEP); break;
+    case E_SUPER_MEMBER: /* [this] -> [this fn] */
+        emit_op(C, OP_DUP);
+        emit_op_u16(C, OP_GET_SUPER_RECV, e->idx);
+        break;
+    case E_SUPER_INDEX: /* [this key] -> [this fn] */
+        emit_op(C, OP_OVER);
+        emit_op(C, OP_SWAP);
+        emit_op(C, OP_GET_SUPER_ELEM_RECV);
+        break;
     case E_VALUE:
         emit_op(C, OP_UNDEF);
         emit_op(C, OP_SWAP);
@@ -1659,11 +1718,11 @@ static void member_tail(Compiler *C, Exp *e, int allow_call) {
             next(C);
             if (TOK == T_LPAREN) {
                 call_setup(C, e);
-                list_add(C, &ch.two, emit_jump(C, OP_JUMP_IF_NULLISH));
+                chain_add(C, &ch, 1, emit_jump(C, OP_JUMP_IF_NULLISH));
                 emit_call(C, arguments(C));
             } else {
                 discharge(C, e);
-                list_add(C, &ch.one, emit_jump(C, OP_JUMP_IF_NULLISH));
+                chain_add(C, &ch, 0, emit_jump(C, OP_JUMP_IF_NULLISH));
                 e->priv = 0;
                 if (TOK == T_LBRACKET) {
                     next(C);
@@ -1689,7 +1748,7 @@ static void member_tail(Compiler *C, Exp *e, int allow_call) {
             }
         } else if (TOK == T_TEMPLATE && allow_call) {
             int argc;
-            if (ch.one.n || ch.two.n) fail(C, "SyntaxError: a template cannot follow an optional chain");
+            if (ch.n[0] || ch.n[1]) fail(C, "SyntaxError: a template cannot follow an optional chain");
             call_setup(C, e);
             argc = tagged_template(C);
             emit_op_u8(C, OP_CALL, argc);
@@ -1749,8 +1808,8 @@ static void postfix(Compiler *C, Exp *e) {
         load_keep(C, e);
         emit_op(C, OP_TO_NUMERIC);
         emit_op(C, OP_DUP);
-        if (e->k == E_MEMBER) emit_op(C, OP_ROT3);
-        else if (e->k == E_INDEX) emit_op(C, OP_ROT4);
+        if (MEMBER_LIKE(e->k)) emit_op(C, OP_ROT3);
+        else if (INDEX_LIKE(e->k)) emit_op(C, OP_ROT4);
         emit_op(C, inc ? OP_INC : OP_DEC);
         store(C, e);
         emit_op(C, OP_POP);
@@ -1818,6 +1877,12 @@ static void unary(Compiler *C, Exp *e) {
         if (e->k == E_INDEX && e->priv) fail(C, "SyntaxError: private fields cannot be deleted");
         if (e->k == E_MEMBER) emit_op_u16(C, OP_DELETE_PROP, e->idx);
         else if (e->k == E_INDEX) emit_op(C, OP_DELETE_ELEM);
+        else if (e->k == E_SUPER_MEMBER || e->k == E_SUPER_INDEX) {
+            /* after `this` and the key expression, before ToPropertyKey */
+            if (e->k == E_SUPER_INDEX) emit_op(C, OP_POP);
+            emit_op(C, OP_POP);
+            emit_throw_ref(C, "cannot delete a property of super%s", 0);
+        }
         else if (e->k == E_VALUE) {
             emit_op(C, OP_POP);
             emit_op(C, OP_TRUE);
@@ -1891,10 +1956,10 @@ static void logical_assign(Compiler *C, Exp *e, TokType t) {
     jend = emit_jump(C, OP_JUMP);
     patch_here(C, jkeep);
     /* the kept value is on top of whatever the store needed */
-    if (e->k == E_MEMBER) {
+    if (MEMBER_LIKE(e->k)) {
         emit_op(C, OP_SWAP);
         emit_op(C, OP_POP);
-    } else if (e->k == E_INDEX) {
+    } else if (INDEX_LIKE(e->k)) {
         emit_op(C, OP_ROT3);
         emit_op(C, OP_POP);
         emit_op(C, OP_POP);
@@ -1904,7 +1969,7 @@ static void logical_assign(Compiler *C, Exp *e, TokType t) {
 
 static void yield_expr(Compiler *C) {
     next(C); /* yield */
-    if (TOK == T_STAR) {
+    if (TOK == T_STAR && !C->lx.tok.nl_before) { /* yield \n * x is yield, then a stray * */
         /* the generator's driver runs the whole delegation (px_iter.c,
          * px_asyncgen.c) and resumes here with its completion */
         next(C);
@@ -2186,7 +2251,7 @@ static void bind_element(Compiler *C, int mode, int kind, const Source *src, int
         emit_source(C, src);
         if (TOK == T_ASSIGN) {
             if (!allow_default) unexpected(C);
-            apply_default(C, bare && e.k != E_MEMBER && e.k != E_INDEX ? e.name : PX_UNDEFINED);
+            apply_default(C, bare && !MEMBER_LIKE(e.k) && !INDEX_LIKE(e.k) ? e.name : PX_UNDEFINED);
         }
         store(C, &e);
         emit_op(C, OP_POP);
@@ -2310,11 +2375,13 @@ static void bind_target(Compiler *C, int mode, int kind) {
         check_target(C, &e, "destructuring target");
         switch (e.k) {
         case E_MEMBER: /* [v obj] -> [obj v] */
+        case E_SUPER_MEMBER:
             emit_op(C, OP_SWAP);
             store(C, &e);
             emit_op(C, OP_POP);
             break;
         case E_INDEX: /* [v obj key] -> [obj key v] */
+        case E_SUPER_INDEX:
             emit_op(C, OP_ROT3);
             emit_op(C, OP_ROT3);
             store(C, &e);
@@ -2552,9 +2619,14 @@ static void prescan(Compiler *C, Decls *d, int want_vars, int *uses_arguments) {
     int      bnfn[128];              /* nfn there: a block inside a nested function is not recorded */
     int      vars_seen = 0;
     int      hits0 = C->args_hits;
+    int      case_label = 0, qdepth = 0; /* inside `case ...:` (switch bodies) */
+    int      async_stmt = 0;              /* the last `async` started a statement */
 
     for (;;) {
         TokType t = TOK;
+        if (t == T_ASYNC)
+            async_stmt = prev == T_SEMI || prev == T_RBRACE || prev == T_LBRACE || prev == T_EXPORT ||
+                         prev == T_DEFAULT || C->lx.tok.nl_before;
         if (C->args_hits != hits0) {
             /* `arguments` inside a declarator's initializer (skipped over) */
             hits0 = C->args_hits;
@@ -2562,6 +2634,24 @@ static void prescan(Compiler *C, Decls *d, int want_vars, int *uses_arguments) {
             if (uses_arguments && nfn_plain == 0) *uses_arguments = 1;
         }
         if (t == T_EOF) break;
+        if (braces == 0 && parens == 0 && brackets == 0 && nfn == 0) {
+            /* a switch body: a statement starts after `case x:` (whose
+             * expression may hold ?: of its own) */
+            if (t == T_CASE || (t == T_DEFAULT && prev != T_EXPORT)) {
+                case_label = 1;
+                qdepth     = 0;
+            } else if (case_label && t == T_QUESTION) {
+                qdepth++;
+            } else if (case_label && t == T_COLON) {
+                if (qdepth == 0) {
+                    case_label = 0;
+                    prev       = T_SEMI;
+                    next(C);
+                    continue;
+                }
+                qdepth--;
+            }
+        }
         if (t == T_RBRACE) {
             if (ntmpl > 0 && tmpl[ntmpl - 1] == braces) {
                 lex_template_continue(&C->lx);
@@ -2710,7 +2800,7 @@ static void prescan(Compiler *C, Decls *d, int want_vars, int *uses_arguments) {
             prev = T_IMPORT;
             continue;
         } else if (t == T_FUNCTION && nfn == 0 && braces == 0 && parens == 0 && brackets == 0 &&
-                   (prev == T_SEMI || prev == T_RBRACE || prev == T_LBRACE || prev == T_ASYNC ||
+                   (prev == T_SEMI || prev == T_RBRACE || prev == T_LBRACE || (prev == T_ASYNC && async_stmt) ||
                     prev == T_EXPORT || prev == T_DEFAULT || C->lx.tok.nl_before)) {
             /* A function declaration at the block's own level. */
             next(C);
@@ -2958,6 +3048,7 @@ static int parameters(Compiler *C) {
     FuncState *fs = C->fs;
     Param      ps[MAX_PARAMS];
     int        n = 0, rest = -1, i, simple = 1, length = -1, hits0 = C->args_hits;
+    int        names_before[MAX_PARAMS + 1], first_name = 0; /* pattern names of params < i */
     uint32_t   roots0;
     LexState   after;
     Decls     *d;
@@ -3015,18 +3106,33 @@ static int parameters(Compiler *C) {
     roots0 = C->vm->nroots;
     d      = decls_new(C, 0);
     for (i = 0; i < n; i++) {
+        names_before[i] = (int)d->n;
         if (!ps[i].pattern) continue;
         lex_restore(&C->lx, ps[i].pos);
         scan_pattern(C, d, K_LET); /* lexical for the scan: a name twice is an error */
     }
+    names_before[n] = (int)d->n;
+    first_name      = fs->nactive;
     for (i = 0; i < d->n; i++) {
         if (find_local(fs, DECL_NAME(d, i)) >= 0) fail(C, "SyntaxError: duplicate parameter name");
         declare_local(C, DECL_NAME(d, i), K_VAR);
     }
     decls_free(C, d);
     C->vm->nroots = roots0;
+    /* A named function expression sees its own name, in the defaults too.
+     * Filled in by the call itself (push_frame), not by code. */
+    if (!(fs->flags & PX_PROTO_ARROW) && px_is_ptr(fs->name) &&
+        !(fs->flags & (PX_PROTO_METHOD | PX_PROTO_CLASS_CTOR)) && find_local(fs, fs->name) < 0) {
+        int self_slot              = declare_local(C, fs->name, K_CONST);
+        fs->locals[self_slot].init = 1;
+        fs->self_slot1             = self_slot + 1;
+    }
     fs->ctx |= CTX_PARAMS;
     for (i = 0; i < n; i++) {
+        fs->tdz_lo  = ps[i].slot;
+        fs->tdz_hi  = ps[n - 1].slot + 1;
+        fs->tdz_lo2 = first_name + names_before[i];
+        fs->tdz_hi2 = first_name + names_before[n];
         if (ps[i].has_default) {
             int skip;
             emit_op_u8(C, OP_GET_LOCAL, ps[i].slot);
@@ -3045,6 +3151,7 @@ static int parameters(Compiler *C) {
             bind_target(C, BIND_DECL, K_VAR);
         }
     }
+    fs->tdz_lo = fs->tdz_hi = fs->tdz_lo2 = fs->tdz_hi2 = 0;
     fs->ctx &= ~CTX_PARAMS;
     lex_restore(&C->lx, after);
     return simple;
@@ -3891,6 +3998,8 @@ static void for_statement(Compiler *C) {
         var_declarations(C, kind);
         C->no_in = 0;
     } else if (TOK != T_SEMI) {
+        if (TOK == T_ASYNC && !is_await && peek_is(C, T_OF))
+            fail(C, "SyntaxError: for (async of ...) is ambiguous: use for ((async) of ...)");
         if (for_in_of_ahead(C)) {
             for_in_of(C, -1, is_await);
             block_end(C, &b);
@@ -4161,6 +4270,37 @@ static void function_declaration(Compiler *C, int flags) {
  * "m" / import "m". The bindings were declared (as constants) by the
  * module's pre-scan; here they are initialised from the host resolver's
  * namespace object. */
+/* A contextual keyword of module syntax (as, from): never with escapes. */
+static int tok_is_kw(Compiler *C, const char *w) { return tok_is_word(C, w) && !C->lx.tok.escaped; }
+
+/* ModuleExportName: an IdentifierName, or a string without lone
+ * surrogates. Returns the name as a key; *is_str tells which. */
+static PxValue export_name(Compiler *C, int *is_str) {
+    PxValue name;
+    *is_str = TOK == T_STRING;
+    if (TOK == T_STRING) {
+        const uint16_t *s = C->lx.tok.str;
+        uint32_t        n = C->lx.tok.str_len, i;
+        for (i = 0; i < n; i++) {
+            if (s[i] >= 0xD800 && s[i] <= 0xDBFF && i + 1 < n && s[i + 1] >= 0xDC00 && s[i + 1] <= 0xDFFF) i++;
+            else if (s[i] >= 0xD800 && s[i] <= 0xDFFF) fail(C, "SyntaxError: an export name must be well-formed");
+        }
+        name = tok_string_as(C, 1);
+    } else if (is_prop_name_tok(TOK)) {
+        name = tok_atom(C);
+    } else {
+        unexpected(C);
+    }
+    next(C);
+    return name;
+}
+
+/* The module's exported names, for the duplicate check. */
+static void add_export(Compiler *C, PxValue name) {
+    if (decl_find(C->exports, name) >= 0) fail(C, "SyntaxError: duplicate export");
+    decl_add(C, C->exports, name, K_VAR);
+}
+
 static void import_declaration(Compiler *C) {
     FuncState *fs = C->fs;
     LexState   clause;
@@ -4170,8 +4310,8 @@ static void import_declaration(Compiler *C) {
     clause = lex_save(&C->lx);
     if (TOK != T_STRING) {
         has_clause = 1;
-        while (TOK != T_EOF && !tok_is_word(C, "from")) skip_balanced(C);
-        if (!tok_is_word(C, "from")) fail(C, "SyntaxError: expected 'from' in import");
+        while (TOK != T_EOF && TOK != T_SEMI && !tok_is_kw(C, "from")) skip_balanced(C);
+        if (!tok_is_kw(C, "from")) fail(C, "SyntaxError: expected 'from' in import");
         next(C);
     }
     if (TOK != T_STRING) fail(C, "SyntaxError: expected a module specifier string");
@@ -4186,32 +4326,33 @@ static void import_declaration(Compiler *C) {
     }
     {
         LexState after = lex_save(&C->lx);
+        int      first = 1;
         tmp            = declare_temp(C);
         emit_op_u8(C, OP_PUT_LOCAL, tmp);
         lex_restore(&C->lx, clause);
         for (;;) {
             if (TOK == T_STAR) {
                 next(C);
-                if (!tok_is_word(C, "as")) fail(C, "SyntaxError: expected 'as'");
+                if (!tok_is_kw(C, "as")) fail(C, "SyntaxError: expected 'as'");
                 next(C);
                 emit_op_u8(C, OP_GET_LOCAL, tmp);
-                init_name(C, tok_atom(C), K_CONST);
-                next(C);
+                init_name(C, binding_name(C), K_CONST);
             } else if (TOK == T_LBRACE) {
                 next(C);
                 while (TOK != T_RBRACE) {
-                    PxValue imported, local;
-                    if (TOK == T_STRING) imported = tok_string_as(C, 1);
-                    else if (is_prop_name_tok(TOK)) imported = tok_atom(C);
-                    else unexpected(C);
+                    PxValue  imported, local;
+                    LexState at = lex_save(&C->lx);
+                    int      is_str;
+                    imported    = export_name(C, &is_str);
                     PX_ROOT(C->vm, imported);
-                    next(C);
-                    local = imported;
-                    if (tok_is_word(C, "as")) {
+                    if (tok_is_kw(C, "as")) {
                         next(C);
-                        local = tok_atom(C);
-                        next(C);
+                    } else {
+                        /* `{ a }`: the name is the binding too */
+                        if (is_str) fail(C, "SyntaxError: expected 'as' after a string import name");
+                        lex_restore(&C->lx, at);
                     }
+                    local = binding_name(C);
                     PX_ROOT(C->vm, local);
                     emit_op_u8(C, OP_GET_LOCAL, tmp);
                     emit_prop(C, OP_GET_PROP, add_const(C, imported));
@@ -4220,18 +4361,22 @@ static void import_declaration(Compiler *C) {
                     if (TOK != T_RBRACE) expect(C, T_COMMA);
                 }
                 next(C);
-            } else if (is_name(C)) {
+            } else if (first && TOK != T_LBRACE) {
                 /* default import */
                 emit_op_u8(C, OP_GET_LOCAL, tmp);
                 emit_prop(C, OP_GET_PROP, add_const(C, C->vm->atom[PX_ATOM_default]));
-                init_name(C, tok_atom(C), K_CONST);
+                init_name(C, binding_name(C), K_CONST);
+                if (TOK != T_COMMA) break;
                 next(C);
+                if (TOK != T_STAR && TOK != T_LBRACE) unexpected(C);
+                first = 0;
+                continue;
             } else {
                 unexpected(C);
             }
-            if (TOK != T_COMMA) break;
-            next(C);
+            break;
         }
+        if (!tok_is_kw(C, "from")) unexpected(C);
         fs->nactive--; /* the temporary */
         lex_restore(&C->lx, after);
     }
@@ -4241,41 +4386,119 @@ static void import_declaration(Compiler *C) {
  * a PSPX app's entry module has nobody importing it, so exports only
  * declare; `export default` evaluates its expression. */
 static void export_declaration(Compiler *C) {
+    int is_str;
     next(C); /* export */
     if (TOK == T_DEFAULT) {
         next(C);
+        add_export(C, C->vm->atom[PX_ATOM_default]);
         if (TOK == T_FUNCTION || TOK == T_CLASS || (TOK == T_ASYNC && async_ahead(C) == 2)) {
-            /* named: a declaration; anonymous: an expression */
+            /* named: a declaration; anonymous: a declaration too (no `;`,
+             * no call after it), whose function is named "default" */
             LexState st    = lex_save(&C->lx);
-            int      named = 0;
+            int      named = 0, flags = 0;
             if (TOK == T_ASYNC) next(C);
             next(C); /* function / class */
             if (TOK == T_STAR) next(C);
-            named = is_name_tok_raw(TOK);
+            named = TOK != T_LPAREN && TOK != T_LBRACE && TOK != T_EXTENDS;
             lex_restore(&C->lx, st);
             if (named) {
                 statement(C);
-            } else {
-                expr(C);
-                emit_op(C, OP_POP);
-                semicolon(C);
+                return;
             }
+            if (TOK == T_CLASS) {
+                next(C);
+                class_def(C, C->vm->atom[PX_ATOM_default], 0);
+            } else {
+                if (TOK == T_ASYNC) {
+                    flags |= PX_PROTO_ASYNC;
+                    next(C);
+                }
+                next(C); /* function */
+                if (TOK == T_STAR) {
+                    flags |= PX_PROTO_GENERATOR;
+                    next(C);
+                }
+                compile_function(C, C->vm->atom[PX_ATOM_default], flags);
+            }
+            emit_op(C, OP_POP);
             return;
         }
-        expr(C);
+        expr_value(C);
         emit_op(C, OP_POP);
         semicolon(C);
         return;
     }
-    if (TOK == T_LBRACE || TOK == T_STAR) {
-        /* export { a, b as c } [from "m"] / export * from "m" */
-        while (TOK != T_SEMI && TOK != T_EOF && !C->lx.tok.nl_before) {
-            skip_balanced(C);
-            if (TOK == T_STRING || tok_is_word(C, "from")) continue;
-            if (C->lx.tok.nl_before) break;
+    if (TOK == T_STAR) {
+        /* export * [as name] from "m" */
+        next(C);
+        if (tok_is_kw(C, "as")) {
+            next(C);
+            add_export(C, export_name(C, &is_str));
         }
-        if (TOK == T_SEMI) next(C);
+        if (!tok_is_kw(C, "from")) unexpected(C);
+        next(C);
+        if (TOK != T_STRING) unexpected(C);
+        next(C);
+        semicolon(C);
         return;
+    }
+    if (TOK == T_LBRACE) {
+        /* export { a, b as c } [from "m"]: without `from`, the local names
+         * must be declared in the module (checked at its end) */
+        LexState list = lex_save(&C->lx);
+        int      from = 0;
+        skip_balanced(C);
+        if (tok_is_kw(C, "from")) {
+            from = 1;
+            next(C);
+            if (TOK != T_STRING) unexpected(C);
+            next(C);
+        }
+        semicolon(C);
+        {
+            LexState after = lex_save(&C->lx);
+            lex_restore(&C->lx, list);
+            next(C); /* { */
+            while (TOK != T_RBRACE) {
+                PxValue local = export_name(C, &is_str);
+                if (!from) {
+                    if (is_str) fail(C, "SyntaxError: a string cannot name a local export");
+                    decl_add(C, C->export_locals, local, K_VAR);
+                }
+                if (tok_is_kw(C, "as")) {
+                    next(C);
+                    add_export(C, export_name(C, &is_str));
+                } else {
+                    add_export(C, local);
+                }
+                if (TOK != T_RBRACE) expect(C, T_COMMA);
+            }
+            lex_restore(&C->lx, after);
+        }
+        return;
+    }
+    /* export var / let / const / function / class: the names it declares */
+    {
+        LexState st     = lex_save(&C->lx);
+        uint32_t roots0 = C->vm->nroots;
+        Decls   *d      = decls_new(C, 0);
+        int      i;
+        if (TOK == T_VAR || TOK == T_LET || TOK == T_CONST) {
+            next(C);
+            scan_target(C, d, K_VAR);
+            scan_declarators(C, d, K_VAR);
+        } else if (TOK == T_FUNCTION || TOK == T_CLASS || (TOK == T_ASYNC && async_ahead(C) == 2)) {
+            if (TOK == T_ASYNC) next(C);
+            next(C);
+            if (TOK == T_STAR) next(C);
+            if (is_name_tok_raw(TOK) || TOK == T_IDENT) decl_add(C, d, tok_atom(C), K_VAR);
+        } else {
+            unexpected(C);
+        }
+        for (i = 0; i < d->n; i++) add_export(C, DECL_NAME(d, i));
+        decls_free(C, d);
+        C->vm->nroots = roots0;
+        lex_restore(&C->lx, st);
     }
     statement(C);
 }
@@ -4399,13 +4622,9 @@ static void statement(Compiler *C) {
         semicolon(C);
         break;
     case T_IMPORT:
-        if (!fs->is_module || fs->parent) fail(C, "SyntaxError: import is only valid at the top level of a module");
-        import_declaration(C);
-        break;
     case T_EXPORT:
-        if (!fs->is_module || fs->parent) fail(C, "SyntaxError: export is only valid at the top level of a module");
-        export_declaration(C);
-        break;
+        /* module items: px_compile reads them at the module's top level */
+        fail(C, "SyntaxError: %s is only valid at the top level of a module", tok_name(TOK));
     case T_WITH: fail(C, "SyntaxError: with is not allowed");
     default:
         if (TOK == T_ASYNC && async_ahead(C) == 2) {
@@ -4498,9 +4717,28 @@ PxProto *px_compile(PxVM *vm, const char *src, size_t len, const char *filename,
         fs->is_module = module;
         if (!module) fs->completion = declare_temp(C);
         next(C);
+        if (module) {
+            C->exports       = decls_new(C, 0);
+            C->export_locals = decls_new(C, 0);
+        }
         block_begin(C, &b, 1, NULL);
         fs->var_floor = fs->nactive;
-        while (TOK != T_EOF) statement(C);
+        while (TOK != T_EOF) {
+            if (module && TOK == T_EXPORT) export_declaration(C);
+            else if (module && TOK == T_IMPORT && !peek_is(C, T_LPAREN) && !peek_is(C, T_DOT))
+                import_declaration(C);
+            else statement(C);
+        }
+        if (module) {
+            /* export { x }: x must be declared in the module */
+            int i;
+            for (i = 0; i < C->export_locals->n; i++)
+                if (find_local(fs, DECL_NAME(C->export_locals, i)) < 0)
+                    fail(C, "SyntaxError: export of a name the module does not declare");
+            decls_free(C, C->exports);
+            decls_free(C, C->export_locals);
+            vm->nroots = C->nroots; /* their roots, the only ones left */
+        }
         block_end(C, &b);
         if (module) emit_op(C, OP_RETURN_UNDEF);
         else {

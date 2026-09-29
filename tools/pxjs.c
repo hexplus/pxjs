@@ -8,8 +8,9 @@
  *                                     a check script runs, and a collection
  *
  * Globals for scripts: print(...), console.log/info/warn/error(...),
- * assert(cond, message), assertEq(actual, expected, message) and
- * gc(). Exit code 0 when every file ran without an uncaught exception. */
+ * assert(cond, message), assertEq(actual, expected, message), gc() and
+ * syntaxError(source[, module]) (does it fail to compile?). Exit code 0
+ * when every file ran without an uncaught exception. */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +69,32 @@ static PxValue js_mem(PxVM *vm, PxValue t, int argc, PxValue *argv) {
     (void)argv;
     px_mem_stats(vm, &s);
     return px_number(vm, (double)s.used_bytes);
+}
+
+/* syntaxError(source[, module]): does the source fail to compile with a
+ * SyntaxError? It is compiled but never run: a script starts with a throw
+ * (its hoisted declarations still happen), a module waits forever. */
+static PxValue js_syntax_error(PxVM *vm, PxValue t, int argc, PxValue *argv) {
+    static const char script_head[] = "throw 'pxjs-probe';\n", module_head[] = "await new Promise(() => {});\n";
+    int         module = argc > 1 && argv[1] == PX_TRUE, n, rc;
+    const char *head   = module ? module_head : script_head;
+    size_t      hl     = strlen(head);
+    char       *src;
+    PxValue     promise;
+    (void)t;
+    if (argc < 1 || !px_is_string(argv[0])) return px_throw_error(vm, PX_TYPE_ERROR, "syntaxError needs a string");
+    n   = px_to_utf8(vm, argv[0], NULL, 0);
+    src = (char *)malloc(hl + (size_t)n + 1);
+    if (!src) return px_throw_error(vm, PX_RANGE_ERROR, "out of memory");
+    memcpy(src, head, hl);
+    px_to_utf8(vm, argv[0], src + hl, (size_t)n + 1);
+    rc = module ? px_eval_module(vm, src, hl + (size_t)n, "<probe>", &promise)
+                : px_eval(vm, src, hl + (size_t)n, "<probe>", NULL);
+    free(src);
+    if (rc == 0) return PX_FALSE;
+    if (strstr(px_error_text(vm), "pxjs-probe")) return PX_FALSE;
+    if (strncmp(px_error_text(vm), "SyntaxError", 11) == 0) return PX_TRUE;
+    return px_throw_error(vm, PX_ERROR, "syntaxError: not a SyntaxError: %s", px_error_text(vm));
 }
 
 static uint64_t now_us(void) {
@@ -165,6 +192,7 @@ int main(int argc, char **argv) {
         px_set_global_function(vm, "gc", js_gc, 0);
         px_set_global_function(vm, "heapUsed", js_mem, 0);
         px_set_global_function(vm, "now", js_now, 0);
+        px_set_global_function(vm, "syntaxError", js_syntax_error, 2);
         /* console.* all print */
         {
             static const char setup[] =

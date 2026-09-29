@@ -4,10 +4,9 @@
  * compare with SameValueZero: numbers by value (NaN equals NaN, -0 equals
  * 0), strings by content, everything else by identity.
  *
- * WeakMap and WeakSet hold their keys strongly: entries are not dropped
- * when a key becomes otherwise unreachable. Apps that use them as caches
- * keyed by short-lived objects should delete entries themselves. This is
- * documented in docs/engine.md. */
+ * WeakMap, WeakSet, WeakRef and FinalizationRegistry use the same table;
+ * the collector treats their keys weakly (ephemerons, see px_heap.c).
+ * Their keys may be objects, or symbols not made by Symbol.for. */
 
 #include <math.h>
 
@@ -131,71 +130,98 @@ static int map_set(PxVM *vm, PxValue mv, PxValue key, PxValue value) {
     return 0;
 }
 
-static PxValue map_ctor(PxVM *vm, PxValue t, int argc, PxValue *argv) {
-    int     kind = vm->native_magic;
+/* CanBeHeldWeakly: an object, or a symbol not made by Symbol.for */
+static int weak_ok(PxVM *vm, PxValue v) {
+    if (px_is_obj(v)) return 1;
+    return px_is_ptr(v) && px_type_of(v) == PX_T_SYMBOL && px_symbol_registered(vm, v) == 0;
+}
+
+/* The object a built-in constructor makes for `new.target` (which must be
+ * there): newTarget.prototype, or the intrinsic `proto_index`. */
+static PxValue new_collection(PxVM *vm, int proto_index, int kind) {
+    PxValue nt = vm->native_new_target, proto = vm->protos[proto_index];
     PxMap  *m;
-    PxValue mv, iter, item;
-    int     r;
-    (void)t;
-    m = (PxMap *)px_obj_new(vm, PX_T_MAP, sizeof(PxMap), vm->protos[PX_PROTO_MAP + kind]);
+    if (nt == PX_UNDEFINED) return px_throw_error(vm, PX_TYPE_ERROR, "the constructor requires 'new'");
+    if (nt != vm->native_callee) {
+        proto = px_get(vm, nt, vm->atom[PX_ATOM_prototype]);
+        if (proto == PX_EXCEPTION) return proto;
+        if (!px_is_obj(proto)) proto = vm->protos[proto_index];
+    }
+    PX_ROOT(vm, proto);
+    m = (PxMap *)px_obj_new(vm, PX_T_MAP, sizeof(PxMap), proto);
+    px_pop_roots(vm, 1);
     if (!m) return PX_EXCEPTION;
     m->kind = (uint32_t)kind;
-    mv      = px_from_ptr(m);
-    if (ARG(0) == PX_UNDEFINED || ARG(0) == PX_NULL) return mv;
+    return px_from_ptr(m);
+}
+
+/* new Map/Set/WeakMap/WeakSet(iterable): each item goes through the new
+ * object's own set/add (which a subclass may replace); an abrupt step
+ * closes the iterator. */
+static PxValue map_ctor(PxVM *vm, PxValue t, int argc, PxValue *argv) {
+    int     kind = vm->native_magic, is_map = kind == PX_MAP_MAP || kind == PX_MAP_WEAKMAP, r;
+    PxValue mv, adder = PX_UNDEFINED, rec = PX_UNDEFINED, item, args[2];
+    (void)t;
+    mv = new_collection(vm, PX_PROTO_MAP + kind, kind);
+    if (mv == PX_EXCEPTION || ARG(0) == PX_UNDEFINED || ARG(0) == PX_NULL) return mv;
     PX_ROOT(vm, mv);
-    iter = px_get_iterator(vm, argv[0]);
-    if (iter == PX_EXCEPTION) goto fail;
-    PX_ROOT(vm, iter);
-    while ((r = px_iterator_step(vm, iter, &item)) > 0) {
-        PX_ROOT(vm, item);
-        if (kind == PX_MAP_SET || kind == PX_MAP_WEAKSET) {
-            if ((kind == PX_MAP_WEAKSET && !px_is_obj(item)) || map_set(vm, mv, item, item) < 0) {
-                if (kind == PX_MAP_WEAKSET && !px_is_obj(item)) px_throw_error(vm, PX_TYPE_ERROR, "invalid value used in weak set");
-                px_pop_roots(vm, 1);
-                goto fail2;
-            }
-        } else {
-            PxValue k, v;
+    PX_ROOT(vm, adder);
+    PX_ROOT(vm, rec);
+    adder = px_get(vm, mv, px_intern_cstr(vm, is_map ? "set" : "add"));
+    if (adder == PX_EXCEPTION) goto fail;
+    if (!px_is_callable(adder)) {
+        px_throw_error(vm, PX_TYPE_ERROR, "the collection's %s is not a function", is_map ? "set" : "add");
+        goto fail;
+    }
+    rec = px_iter_record(vm, argv[0], 0);
+    if (rec == PX_EXCEPTION) goto fail;
+    while ((r = px_record_step(vm, rec, &item)) > 0) {
+        args[0] = item;
+        if (is_map) {
             if (!px_is_obj(item)) {
                 px_throw_error(vm, PX_TYPE_ERROR, "iterator value is not an entry object");
-                px_pop_roots(vm, 1);
-                goto fail2;
+                goto close;
             }
-            k = px_get_index(vm, item, 0);
-            if (k == PX_EXCEPTION) {
+            PX_ROOT(vm, item);
+            args[0] = px_get_index(vm, item, 0);
+            if (args[0] != PX_EXCEPTION) {
+                PX_ROOT(vm, args[0]);
+                args[1] = px_get_index(vm, item, 1);
                 px_pop_roots(vm, 1);
-                goto fail2;
-            }
-            PX_ROOT(vm, k);
-            v = px_get_index(vm, item, 1);
-            if (v == PX_EXCEPTION || (kind == PX_MAP_WEAKMAP && !px_is_obj(k)) || map_set(vm, mv, k, v) < 0) {
-                if (v != PX_EXCEPTION && kind == PX_MAP_WEAKMAP && !px_is_obj(k))
-                    px_throw_error(vm, PX_TYPE_ERROR, "invalid value used as weak map key");
-                px_pop_roots(vm, 2);
-                goto fail2;
             }
             px_pop_roots(vm, 1);
+            if (args[0] == PX_EXCEPTION || args[1] == PX_EXCEPTION) goto close;
         }
-        px_pop_roots(vm, 1);
+        if (px_call(vm, adder, mv, is_map ? 2 : 1, args) == PX_EXCEPTION) goto close;
     }
-    if (r < 0) goto fail2;
-    px_pop_roots(vm, 2);
+    if (r < 0) goto fail;
+    px_pop_roots(vm, 3);
     return mv;
-fail2:
-    px_pop_roots(vm, 1);
+close:
+    px_iterator_close_throw(vm, ((PxVec *)px_ptr(rec))->items[0]);
 fail:
-    px_pop_roots(vm, 1);
+    px_pop_roots(vm, 3);
     return PX_EXCEPTION;
 }
 
-/* get (0) / has (1) / delete (2): magic; the kind comes from the receiver. */
+/* The receiver, if it is a collection of the kind in the method's magic
+ * (bits 4 and up; the low bits are the method's own). */
+#define KIND(k) ((k) << 4)
+static PxMap *this_map(PxVM *vm, PxValue t) {
+    if (!px_is_obj(t) || px_type_of(t) != PX_T_MAP || ((PxMap *)px_ptr(t))->kind != (uint32_t)(vm->native_magic >> 4)) {
+        px_throw_error(vm, PX_TYPE_ERROR, "incompatible receiver");
+        return NULL;
+    }
+    return (PxMap *)px_ptr(t);
+}
+
+/* get (0) / has (1) / delete (2) */
 static PxValue mapp_lookup(PxVM *vm, PxValue t, int argc, PxValue *argv) {
-    PxMap  *m;
+    PxMap  *m = this_map(vm, t);
     int32_t e;
-    if (!px_is_obj(t) || px_type_of(t) != PX_T_MAP) return px_throw_error(vm, PX_TYPE_ERROR, "incompatible receiver");
-    m = (PxMap *)px_ptr(t);
+    if (!m) return PX_EXCEPTION;
     e = map_find(vm, m, ARG(0));
-    switch (vm->native_magic) {
+    switch (vm->native_magic & 15) {
     case 0: return e < 0 ? PX_UNDEFINED : m->entries->items[2 * e + 1];
     case 1: return px_bool(e >= 0);
     default:
@@ -208,10 +234,9 @@ static PxValue mapp_lookup(PxVM *vm, PxValue t, int argc, PxValue *argv) {
 }
 
 static PxValue mapp_set(PxVM *vm, PxValue t, int argc, PxValue *argv) {
-    PxMap *m;
-    if (!px_is_obj(t) || px_type_of(t) != PX_T_MAP) return px_throw_error(vm, PX_TYPE_ERROR, "incompatible receiver");
-    m = (PxMap *)px_ptr(t);
-    if ((m->kind == PX_MAP_WEAKMAP || m->kind == PX_MAP_WEAKSET) && !px_is_obj(ARG(0)))
+    PxMap *m = this_map(vm, t);
+    if (!m) return PX_EXCEPTION;
+    if ((m->kind == PX_MAP_WEAKMAP || m->kind == PX_MAP_WEAKSET) && !weak_ok(vm, ARG(0)))
         return px_throw_error(vm, PX_TYPE_ERROR, "invalid value used as weak key");
     PX_ROOT(vm, t);
     if (map_set(vm, t, ARG(0), (m->kind == PX_MAP_SET || m->kind == PX_MAP_WEAKSET) ? ARG(0) : ARG(1)) < 0) {
@@ -223,11 +248,10 @@ static PxValue mapp_set(PxVM *vm, PxValue t, int argc, PxValue *argv) {
 }
 
 static PxValue mapp_clear(PxVM *vm, PxValue t, int argc, PxValue *argv) {
-    PxMap *m;
+    PxMap *m = this_map(vm, t);
     (void)argc;
     (void)argv;
-    if (!px_is_obj(t) || px_type_of(t) != PX_T_MAP) return px_throw_error(vm, PX_TYPE_ERROR, "incompatible receiver");
-    m          = (PxMap *)px_ptr(t);
+    if (!m) return PX_EXCEPTION;
     m->entries = NULL;
     m->index   = NULL;
     m->cap = m->used = m->count = 0;
@@ -237,7 +261,7 @@ static PxValue mapp_clear(PxVM *vm, PxValue t, int argc, PxValue *argv) {
 static PxValue mapp_size(PxVM *vm, PxValue t, int argc, PxValue *argv) {
     (void)argc;
     (void)argv;
-    if (!px_is_obj(t) || px_type_of(t) != PX_T_MAP) return px_throw_error(vm, PX_TYPE_ERROR, "incompatible receiver");
+    if (!this_map(vm, t)) return PX_EXCEPTION;
     return px_number(vm, ((PxMap *)px_ptr(t))->count);
 }
 
@@ -245,7 +269,7 @@ static PxValue mapp_for_each(PxVM *vm, PxValue t, int argc, PxValue *argv) {
     PxMap   *m;
     PxValue  fn = ARG(0);
     uint32_t i;
-    if (!px_is_obj(t) || px_type_of(t) != PX_T_MAP) return px_throw_error(vm, PX_TYPE_ERROR, "incompatible receiver");
+    if (!this_map(vm, t)) return PX_EXCEPTION;
     if (!px_is_callable(fn)) return px_throw_error(vm, PX_TYPE_ERROR, "forEach: callback is not a function");
     PX_ROOT(vm, t);
     for (i = 0; i < ((PxMap *)px_ptr(t))->used; i++) {
@@ -268,8 +292,8 @@ static PxValue mapp_for_each(PxVM *vm, PxValue t, int argc, PxValue *argv) {
 static PxValue mapp_iter(PxVM *vm, PxValue t, int argc, PxValue *argv) {
     (void)argc;
     (void)argv;
-    if (!px_is_obj(t) || px_type_of(t) != PX_T_MAP) return px_throw_error(vm, PX_TYPE_ERROR, "incompatible receiver");
-    return px_make_iterobj(vm, t, vm->native_magic);
+    if (!this_map(vm, t)) return PX_EXCEPTION;
+    return px_make_iterobj(vm, t, vm->native_magic & 15);
 }
 
 int px_map_iter_next(PxVM *vm, PxIterObj *it, PxValue *key, PxValue *value) {
@@ -575,8 +599,9 @@ static int keep_alive(PxVM *vm, PxValue target) {
 static PxValue weakref_ctor(PxVM *vm, PxValue t, int argc, PxValue *argv) {
     PxValue r;
     (void)t;
-    if (!px_is_obj(ARG(0))) return px_throw_error(vm, PX_TYPE_ERROR, "WeakRef: the target must be an object");
-    r = px_map_create(vm, PX_MAP_WEAKREF);
+    if (vm->native_new_target == PX_UNDEFINED) return px_throw_error(vm, PX_TYPE_ERROR, "WeakRef requires 'new'");
+    if (!weak_ok(vm, ARG(0))) return px_throw_error(vm, PX_TYPE_ERROR, "WeakRef: the target must be an object or a symbol");
+    r = new_collection(vm, PX_PROTO_WEAKREF, PX_MAP_WEAKREF);
     if (r == PX_EXCEPTION) return r;
     PX_ROOT(vm, r);
     if (map_set(vm, r, argv[0], argv[0]) < 0 || keep_alive(vm, argv[0]) < 0) {
@@ -624,8 +649,9 @@ static PxMap *this_finreg(PxVM *vm, PxValue t) {
 static PxValue finreg_ctor(PxVM *vm, PxValue t, int argc, PxValue *argv) {
     PxValue r;
     (void)t;
+    if (vm->native_new_target == PX_UNDEFINED) return px_throw_error(vm, PX_TYPE_ERROR, "FinalizationRegistry requires 'new'");
     if (!px_is_callable(ARG(0))) return px_throw_error(vm, PX_TYPE_ERROR, "FinalizationRegistry: the cleanup callback must be a function");
-    r = px_map_create(vm, PX_MAP_FINREG);
+    r = new_collection(vm, PX_PROTO_FINREG, PX_MAP_FINREG);
     if (r != PX_EXCEPTION) ((PxMap *)px_ptr(r))->extra = argv[0];
     return r;
 }
@@ -633,9 +659,9 @@ static PxValue finreg_ctor(PxVM *vm, PxValue t, int argc, PxValue *argv) {
 static PxValue finreg_register(PxVM *vm, PxValue t, int argc, PxValue *argv) {
     PxValue target = ARG(0), held = ARG(1), token = ARG(2), list;
     if (!this_finreg(vm, t)) return PX_EXCEPTION;
-    if (!px_is_obj(target)) return px_throw_error(vm, PX_TYPE_ERROR, "register: the target must be an object");
+    if (!weak_ok(vm, target)) return px_throw_error(vm, PX_TYPE_ERROR, "register: the target must be an object or a symbol");
     if (held == target) return px_throw_error(vm, PX_TYPE_ERROR, "register: the held value cannot be the target");
-    if (token != PX_UNDEFINED && !px_is_obj(token)) return px_throw_error(vm, PX_TYPE_ERROR, "register: the token must be an object");
+    if (token != PX_UNDEFINED && !weak_ok(vm, token)) return px_throw_error(vm, PX_TYPE_ERROR, "register: the token must be an object or a symbol");
     PX_ROOT(vm, t);
     list = px_map_lookup(vm, t, target);
     if (list == PX_HOLE) {
@@ -660,7 +686,7 @@ static PxValue finreg_unregister(PxVM *vm, PxValue t, int argc, PxValue *argv) {
     uint32_t i, j, w;
     int      removed = 0;
     if (!m) return PX_EXCEPTION;
-    if (!px_is_obj(token)) return px_throw_error(vm, PX_TYPE_ERROR, "unregister: the token must be an object");
+    if (!weak_ok(vm, token)) return px_throw_error(vm, PX_TYPE_ERROR, "unregister: the token must be an object or a symbol");
     for (i = 0; m->entries && i < m->used; i++) {
         PxValue  key = m->entries->items[2 * i];
         PxArray *a;
@@ -688,26 +714,33 @@ static PxValue finreg_unregister(PxVM *vm, PxValue t, int argc, PxValue *argv) {
 
 int px_collections_init(PxVM *vm) {
     static const char *const names[4] = {"Map", "Set", "WeakMap", "WeakSet"};
+#define M KIND(PX_MAP_MAP)
+#define S KIND(PX_MAP_SET)
+#define WM KIND(PX_MAP_WEAKMAP)
+#define WS KIND(PX_MAP_WEAKSET)
     static const PxFnDef map_fns[] = {
-        {"get", mapp_lookup, 1, 0},     {"has", mapp_lookup, 1, 1},       {"delete", mapp_lookup, 1, 2},
-        {"set", mapp_set, 2, 0},        {"clear", mapp_clear, 0, 0},      {"forEach", mapp_for_each, 1, 0},
-        {"entries", mapp_iter, 0, PX_IT_MAP_ENTRIES}, {"keys", mapp_iter, 0, PX_IT_MAP_KEYS},
-        {"values", mapp_iter, 0, PX_IT_MAP_VALUES},
+        {"get", mapp_lookup, 1, M | 0},     {"has", mapp_lookup, 1, M | 1},   {"delete", mapp_lookup, 1, M | 2},
+        {"set", mapp_set, 2, M},            {"clear", mapp_clear, 0, M},      {"forEach", mapp_for_each, 1, M},
+        {"entries", mapp_iter, 0, M | PX_IT_MAP_ENTRIES}, {"keys", mapp_iter, 0, M | PX_IT_MAP_KEYS},
+        {"values", mapp_iter, 0, M | PX_IT_MAP_VALUES},
     };
     static const PxFnDef set_fns[] = {
-        {"has", mapp_lookup, 1, 1},     {"delete", mapp_lookup, 1, 2},   {"add", mapp_set, 1, 0},
-        {"clear", mapp_clear, 0, 0},    {"forEach", mapp_for_each, 1, 0},
-        {"entries", mapp_iter, 0, PX_IT_MAP_ENTRIES}, {"values", mapp_iter, 0, PX_IT_MAP_VALUES},
-        {"keys", mapp_iter, 0, PX_IT_MAP_VALUES},
+        {"has", mapp_lookup, 1, S | 1},     {"delete", mapp_lookup, 1, S | 2}, {"add", mapp_set, 1, S},
+        {"clear", mapp_clear, 0, S},        {"forEach", mapp_for_each, 1, S},
+        {"entries", mapp_iter, 0, S | PX_IT_MAP_ENTRIES}, {"values", mapp_iter, 0, S | PX_IT_MAP_VALUES},
         {"union", setp_op, 1, SO_UNION},               {"intersection", setp_op, 1, SO_INTERSECTION},
         {"difference", setp_op, 1, SO_DIFFERENCE},     {"symmetricDifference", setp_op, 1, SO_SYMDIFF},
         {"isSubsetOf", setp_op, 1, SO_SUBSET},         {"isSupersetOf", setp_op, 1, SO_SUPERSET},
         {"isDisjointFrom", setp_op, 1, SO_DISJOINT},
     };
-    static const PxFnDef weakmap_fns[] = {{"get", mapp_lookup, 1, 0}, {"has", mapp_lookup, 1, 1},
-                                          {"delete", mapp_lookup, 1, 2}, {"set", mapp_set, 2, 0}};
+    static const PxFnDef weakmap_fns[] = {{"get", mapp_lookup, 1, WM | 0}, {"has", mapp_lookup, 1, WM | 1},
+                                          {"delete", mapp_lookup, 1, WM | 2}, {"set", mapp_set, 2, WM}};
     static const PxFnDef weakset_fns[] = {
-        {"has", mapp_lookup, 1, 1}, {"delete", mapp_lookup, 1, 2}, {"add", mapp_set, 1, 0}};
+        {"has", mapp_lookup, 1, WS | 1}, {"delete", mapp_lookup, 1, WS | 2}, {"add", mapp_set, 1, WS}};
+#undef M
+#undef S
+#undef WM
+#undef WS
     static const PxFnDef map_statics[] = {{"groupBy", map_group_by, 2, 0}};
     int kind;
     for (kind = 0; kind < 4; kind++) {
@@ -720,16 +753,20 @@ int px_collections_init(PxVM *vm) {
         if (px_def_value(vm, vm->global, names[kind], ctor, PX_ATTR_HIDDEN) < 0 ||
             px_def_value(vm, ctor, "prototype", proto, 0) < 0 ||
             px_define(vm, proto, vm->atom[PX_ATOM_constructor], ctor, PX_ATTR_HIDDEN) < 0 ||
-            px_def_fns(vm, proto, fns, n) < 0)
+            px_def_fns(vm, proto, fns, n) < 0 || px_def_tag(vm, proto, names[kind]) < 0)
             return -1;
         if (kind < 2) {
-            PxValue size = px_make_native(vm, mapp_size, "size", 0, 0), k, it;
+            PxValue size = px_make_native(vm, mapp_size, "get size", 0, KIND(kind)), k, it;
             if (size == PX_EXCEPTION) return -1;
+            ((PxObject *)px_ptr(size))->flags |= PX_OBJ_NOT_CTOR;
             k = px_intern_cstr(vm, "size");
             if (k == PX_EXCEPTION || px_define_accessor(vm, proto, k, size, PX_UNDEFINED, PX_ATTR_CONFIGURABLE) < 0)
                 return -1;
+            /* Map: [Symbol.iterator] is entries; Set: it and keys are values */
             it = px_get(vm, proto, px_intern_cstr(vm, kind == 0 ? "entries" : "values"));
-            if (it == PX_EXCEPTION || px_define(vm, proto, vm->sym_iterator, it, PX_ATTR_HIDDEN) < 0) return -1;
+            if (it == PX_EXCEPTION || px_define(vm, proto, vm->sym_iterator, it, PX_ATTR_HIDDEN) < 0 ||
+                (kind == 1 && px_def_value(vm, proto, "keys", it, PX_ATTR_HIDDEN) < 0) || px_def_species(vm, ctor) < 0)
+                return -1;
         }
         if (kind == 0 && px_def_fns(vm, ctor, map_statics, PX_COUNTOF(map_statics)) < 0) return -1;
     }
@@ -741,7 +778,7 @@ int px_collections_init(PxVM *vm) {
         if (px_def_value(vm, vm->global, "WeakRef", ctor, PX_ATTR_HIDDEN) < 0 ||
             px_def_value(vm, ctor, "prototype", proto, 0) < 0 ||
             px_define(vm, proto, vm->atom[PX_ATOM_constructor], ctor, PX_ATTR_HIDDEN) < 0 ||
-            px_def_fns(vm, proto, weakref_fns, PX_COUNTOF(weakref_fns)) < 0)
+            px_def_fns(vm, proto, weakref_fns, PX_COUNTOF(weakref_fns)) < 0 || px_def_tag(vm, proto, "WeakRef") < 0)
             return -1;
     }
     {
@@ -752,7 +789,8 @@ int px_collections_init(PxVM *vm) {
         if (px_def_value(vm, vm->global, "FinalizationRegistry", ctor, PX_ATTR_HIDDEN) < 0 ||
             px_def_value(vm, ctor, "prototype", proto, 0) < 0 ||
             px_define(vm, proto, vm->atom[PX_ATOM_constructor], ctor, PX_ATTR_HIDDEN) < 0 ||
-            px_def_fns(vm, proto, finreg_fns, PX_COUNTOF(finreg_fns)) < 0)
+            px_def_fns(vm, proto, finreg_fns, PX_COUNTOF(finreg_fns)) < 0 ||
+            px_def_tag(vm, proto, "FinalizationRegistry") < 0)
             return -1;
     }
     return 0;

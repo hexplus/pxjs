@@ -45,6 +45,7 @@ OP(SET_GLOBAL, 2, 0)     /* strict: ReferenceError if absent */
 OP(DEF_GLOBAL, 2, -1)    /* var/function at script top level */
 OP(CLOSE_UPVALS, 1, 0)   /* close upvalues for locals >= slot */
 OP(THROW_CONST, 2, 0)    /* assignment to const: u16 atom */
+OP(THROW_REF, 2, 1)      /* ReferenceError: u16 message constant (a parameter read too early, delete super.x) */
 /* properties */
 OP(GET_PROP, 4, 0)       /* obj -> value         u16 atom, u16 cache */
 OP(GET_PROP_KEEP, 4, 1)  /* obj -> obj value     (method calls) */
@@ -125,6 +126,10 @@ OP(SET_FIELDS, 0, -1)        /* ctor fn -> ctor */
 OP(INIT_FIELDS, 0, 0)        /* run this class's field initialisers on `this` */
 OP(GET_SUPER, 2, 1)          /* -> super[key]     u16 key */
 OP(GET_SUPER_ELEM, 0, 0)     /* key -> super[key] */
+OP(GET_SUPER_RECV, 2, 0)     /* this -> super[key]            u16 key (a super reference) */
+OP(GET_SUPER_ELEM_RECV, 0, -1) /* this key -> super[key] */
+OP(SET_SUPER, 2, -1)          /* this v -> v   super[key] = v   u16 key */
+OP(SET_SUPER_ELEM, 0, -2)     /* this key v -> v */
 OP(SUPER_CALL, 1, VAR)       /* args... -> this   u8 argc */
 OP(SUPER_CALL_ARRAY, 0, 0)   /* args -> this */
 OP(SUPER_FORWARD, 0, 1)      /* -> this: super(...arguments) of a default constructor */
@@ -161,6 +166,7 @@ OP(ADD_PRIVATE_METHOD, 1, -2)/* obj #x fn -> obj   u8 PX_MK_* kind: a private me
 OP(HAS_PRIVATE, 0, -1)       /* #x obj -> bool: #x in obj */
 OP(SET_HOME, 0, -1)          /* home fn -> fn: the object `super` means in a private method */
 OP(TO_PROPKEY, 0, 0)         /* v -> ToPropertyKey(v): computed class field names */
+OP(ELEM_KEY, 0, 0)           /* o k -> o ToPropertyKey(k), TypeError first if o is null/undefined: once, for o[k] op= v */
 /* array destructuring, the iterator in a local */
 OP(ITER_STEP_AT, 1, 1)       /* -> the next value (undefined once done)   u8 local */
 OP(ITER_REST_AT, 1, 1)       /* -> an array of the remaining values       u8 local */

@@ -1,0 +1,18 @@
+# Known deviations in the compiler's area (see expectations.txt for the format).
+
+# Each #name of a class is a local of the function that defines the class
+# (250 locals per function); these tests declare thousands of private
+# fields in one class, far beyond anything a PSP app does.
+EXPECTED_FAIL language/identifiers/start-unicode-*-class.js a class may declare at most 128 private names (they are locals of the defining function)
+EXPECTED_FAIL language/identifiers/start-unicode-*-class-escaped.js a class may declare at most 128 private names (they are locals of the defining function)
+
+# Module linking across files: PXJS runs one module and resolves imports
+# through the host (px_set_module_resolver); the test host has no module
+# graph, so resolution-phase errors and bindings of other modules cannot
+# be observed.
+HARNESS_UNSUPPORTED language/module-code/ambiguous-export-bindings/* needs other modules (a module graph)
+HARNESS_UNSUPPORTED language/module-code/instn-iee-err-* needs other modules (a module graph)
+HARNESS_UNSUPPORTED language/module-code/instn-named-err-* needs other modules (a module graph)
+HARNESS_UNSUPPORTED language/module-code/instn-resolve-* needs other modules (a module graph)
+HARNESS_UNSUPPORTED language/module-code/instn-star-err-* needs other modules (a module graph)
+HARNESS_UNSUPPORTED language/module-code/instn-iee-bndng-* needs other modules (a module graph)
