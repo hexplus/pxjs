@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "px_internal.h"
 
@@ -287,4 +288,41 @@ PxValue px_throw_uncatchable(PxVM *vm, const char *message) {
     px_throw_error(vm, PX_INTERNAL_ERROR, "%s", message);
     vm->uncatchable = 1;
     return PX_EXCEPTION;
+}
+
+/* ------------------------------------------------------------ profiling */
+
+const PxProfile *px_profile(PxVM *vm) {
+#ifdef PX_PROFILE
+    return &vm->prof;
+#else
+    (void)vm;
+    return NULL;
+#endif
+}
+
+void px_profile_reset(PxVM *vm) {
+#ifdef PX_PROFILE
+    memset(&vm->prof, 0, sizeof vm->prof);
+#else
+    (void)vm;
+#endif
+}
+
+const char *px_profile_type_name(int type) {
+    static const char *const names[] = {"free",  "number",  "string",  "rope",      "symbol",   "shape",
+                                        "vec",   "dict",    "bytes",   "proto",     "upval",    "iter",
+                                        "accessor", "object", "array", "closure",   "native",   "bound",
+                                        "error", "boxed",   "generator", "promise", "iterobj",  "map",
+                                        "date",  "regexp",  "arraybuffer", "typedarray", "dataview", "proxy"};
+    return type >= 0 && type < (int)(sizeof names / sizeof names[0]) ? names[type] : "?";
+}
+
+const char *px_profile_op_name(int op) {
+    static const char *const names[] = {
+#define OP(name, bytes, effect) #name,
+#include "px_opcodes.h"
+#undef OP
+    };
+    return op >= 0 && op < (int)(sizeof names / sizeof names[0]) ? names[op] : "?";
 }

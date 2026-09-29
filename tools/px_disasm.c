@@ -47,7 +47,7 @@ static void disasm_proto(PxVM *vm, PxProto *p, FILE *out, int depth) {
         fprintf(out, "  %5lu  %-22s", (unsigned long)pc, k_names[op]);
         if (k_bytes[op] == 1) fprintf(out, " %lu", (unsigned long)operand);
         else if (k_bytes[op] == 2 && (op == OP_INT16 || op == OP_JUMP || op == OP_LOOP || op == OP_JUMP_IF_FALSE ||
-                                      op == OP_JUMP_IF_TRUE))
+                                      op == OP_JUMP_IF_TRUE || (op >= OP_LT_JUMP_IF_FALSE && op <= OP_SNE_JUMP_IF_FALSE)))
             fprintf(out, " %d", (int)(int16_t)operand);
         else if (k_bytes[op] > 0) fprintf(out, " %lu", (unsigned long)operand);
         if (op == OP_GET_PROP || op == OP_GET_PROP_KEEP || op == OP_SET_PROP) operand &= 0xFFFF;

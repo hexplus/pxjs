@@ -10,12 +10,15 @@
 #   make                 build/host/pxjs
 #   make test            every tests/js/*.js, normally and under GC stress
 #   make SAN=            without sanitizers (for timing)
+#   make PROFILE=1 SAN= OPT=-O2 OUT=build/prof
+#                        with the performance counters (pxjs --profile)
 
 OUT  := build/host
 CC   ?= gcc
 SAN  ?= -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined
 OPT  ?= -O1 -g
-CFLAGS := -m32 -msse2 -mfpmath=sse -std=gnu11 $(OPT) -fno-strict-aliasing -Wall -Wextra -Wno-unused-parameter -Iinclude -Isrc $(SAN)
+PROFILE ?=
+CFLAGS := -m32 -msse2 -mfpmath=sse -std=gnu11 $(OPT) -fno-strict-aliasing -Wall -Wextra -Wno-unused-parameter -Iinclude -Isrc $(SAN) $(if $(PROFILE),-DPX_PROFILE)
 
 SRCS := src/px_heap.c src/px_string.c src/px_object.c src/px_lexer.c src/px_compiler.c src/px_vm.c \
         src/px_api.c src/px_builtins.c src/px_json.c src/px_iter.c src/px_promise.c \

@@ -144,9 +144,43 @@ static char *read_file(const char *path, size_t *len) {
 
 int px_disassemble(PxVM *vm, const char *src, size_t len, const char *filename, FILE *out);
 
+/* --profile: the counters of a PX_PROFILE build (make PROFILE=1), to stderr */
+static void print_profile(PxVM *vm, const char *file) {
+    const PxProfile *p = px_profile(vm);
+    int              i, j, order[256], n = 0;
+    uint32_t         total_ops = 0, allocs = 0;
+    uint64_t         bytes = 0;
+    if (!p) {
+        fprintf(stderr, "%s: --profile needs a build with PROFILE=1\n", file);
+        return;
+    }
+    for (i = 0; i < 32; i++) allocs += p->alloc_count[i], bytes += p->alloc_bytes[i];
+    fprintf(stderr, "== %s\nallocations: %u, %llu bytes; peak in use %lu bytes\n", file, allocs,
+            (unsigned long long)bytes, (unsigned long)p->peak_used);
+    for (i = 0; i < 32; i++)
+        if (p->alloc_count[i])
+            fprintf(stderr, "  %-12s %9u %11llu bytes\n", px_profile_type_name(i), p->alloc_count[i],
+                    (unsigned long long)p->alloc_bytes[i]);
+    fprintf(stderr, "GCs: %u, %.2f ms total, %.2f ms max, %llu bytes reclaimed\n", p->gc_count,
+            p->gc_us_total / 1000.0, p->gc_us_max / 1000.0, (unsigned long long)p->gc_reclaimed);
+    fprintf(stderr, "inline caches: get own %u, proto %u, miss %u; set hit %u, miss %u; native->JS calls %u\n",
+            p->ic_own_hit, p->ic_proto_hit, p->ic_get_miss, p->ic_set_hit, p->ic_set_miss, p->native_to_js);
+    for (i = 0; i < 256; i++)
+        if (p->op_count[i]) order[n++] = i, total_ops += p->op_count[i];
+    for (i = 1; i < n; i++) /* by count, descending */
+        for (j = i; j > 0 && p->op_count[order[j]] > p->op_count[order[j - 1]]; j--) {
+            int t = order[j];
+            order[j] = order[j - 1], order[j - 1] = t;
+        }
+    fprintf(stderr, "instructions: %u\n", total_ops);
+    for (i = 0; i < n && i < 30; i++)
+        fprintf(stderr, "  %-22s %10u %5.1f%%\n", px_profile_op_name(order[i]), p->op_count[order[i]],
+                100.0 * p->op_count[order[i]] / total_ops);
+}
+
 int main(int argc, char **argv) {
     PxConfig cfg;
-    int      i, failures = 0, stats = 0, disasm = 0, count_allocs = 0;
+    int      i, failures = 0, stats = 0, disasm = 0, count_allocs = 0, profile = 0;
     uint32_t fail_at = 0;
 
     px_config_default(&cfg);
@@ -155,6 +189,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--stats") == 0) stats = 1;
         else if (strcmp(argv[i], "--disasm") == 0) disasm = 1;
         else if (strcmp(argv[i], "--count-allocs") == 0) count_allocs = 1;
+        else if (strcmp(argv[i], "--profile") == 0) profile = 1;
         else if (strcmp(argv[i], "--fail-alloc") == 0 && i + 1 < argc) fail_at = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--heap") == 0 && i + 1 < argc) cfg.heap_bytes = (size_t)atol(argv[++i]) * 1024u;
         else break;
@@ -200,6 +235,7 @@ int main(int argc, char **argv) {
             if (px_eval(vm, setup, sizeof setup - 1, "<setup>", &console) != 0)
                 fprintf(stderr, "setup: %s\n", px_error_text(vm));
         }
+        px_profile_reset(vm); /* the script only, not the setup */
         t0          = now_us();
         g_unhandled = 0;
         px_set_rejection_tracker(vm, track_rejection, NULL);
@@ -249,6 +285,7 @@ int main(int argc, char **argv) {
                     (unsigned long)(s.used_bytes / 1024), (unsigned long)(s.heap_bytes / 1024),
                     (unsigned long)s.gc_count);
         }
+        if (profile) print_profile(vm, argv[i]);
         free(src);
         px_free(vm);
     }

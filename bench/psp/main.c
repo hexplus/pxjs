@@ -263,7 +263,7 @@ static char *read_file(const char *path, size_t *len) {
 }
 
 int main(int argc, char **argv) {
-    char   path[256], line[128], *slash;
+    char   path[256], line[300], *slash;
     char  *src;
     size_t len = 0;
 
