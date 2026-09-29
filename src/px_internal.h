@@ -116,6 +116,12 @@ typedef struct PxString {
 #define px_str_l1(s)  ((uint8_t *)((PxString *)(s) + 1))
 #define px_str_u16(s) ((uint16_t *)((PxString *)(s) + 1))
 
+/* Inline: every string scan (hashing, comparing, parsing) calls it per
+ * code unit. */
+static inline uint16_t px_str_at(const PxString *s, uint32_t i) {
+    return s->wide ? px_str_u16(s)[i] : px_str_l1(s)[i];
+}
+
 /* A concatenation not yet copied: `a + b` for long strings costs one cell,
  * and the copy happens once, when the characters are first needed. */
 typedef struct PxRope {
@@ -596,6 +602,16 @@ struct PxVM {
     uint32_t mark_cap, mark_top;
     int      mark_overflow;
     uint64_t (*now_us)(void);
+#ifdef PX_PROFILE
+    PxProfile prof;
+#endif
+    /* global variable lookups: where a name was last found in the global
+     * object's dictionary. Only a hint -- checked against the entry's key
+     * every time -- so nothing ever invalidates it. */
+    struct {
+        PxValue  name;
+        uint32_t index;
+    } global_hint[64];
 
     /* interning: open addressing over interned strings (weak) */
     PxString **atoms;
@@ -698,12 +714,14 @@ PxValue  px_str_concat(PxVM *vm, PxValue a, PxValue b);
 PxString *px_str_flat(PxVM *vm, PxValue s); /* NULL on OOM */
 uint32_t px_str_len(PxValue s);
 int      px_is_str(PxValue v);
-uint16_t px_str_at(const PxString *s, uint32_t i);
 int      px_str_eq(PxVM *vm, PxValue a, PxValue b); /* -1 on OOM */
 int      px_str_cmp(PxVM *vm, PxValue a, PxValue b, int *out);
 PxValue  px_str_slice(PxVM *vm, PxValue s, uint32_t start, uint32_t end);
 PxValue  px_intern(PxVM *vm, PxValue str); /* key form: interned string or SMI index */
 PxValue  px_intern_cstr(PxVM *vm, const char *s);
+/* The key form of text[0..len) (8-bit, or 16-bit when wide), allocating
+ * only when the name is not interned yet (JSON.parse's property names). */
+PxValue  px_intern_chars(PxVM *vm, const void *text, int wide, uint32_t len);
 PxValue  px_intern_literal(PxVM *vm, PxValue str); /* dedup a string, never an index */
 size_t   px_str_to_utf8(PxVM *vm, PxValue s, char *dst, size_t cap); /* returns needed length */
 PxValue  px_number_to_string(PxVM *vm, double d, int radix);
@@ -1019,6 +1037,26 @@ static inline void px_mark_ptr(PxVM *vm, void *p) {
 }
 
 #define PX_ROOT(vm, var) px_push_root((vm), &(var))
+
+/* Hot-path hints: rare paths out of line, tiny hot helpers inline */
+#if defined(__GNUC__)
+#define PX_NOINLINE      __attribute__((noinline))
+#define PX_ALWAYS_INLINE inline __attribute__((always_inline))
+#define PX_LIKELY(x)     __builtin_expect(!!(x), 1)
+#define PX_UNLIKELY(x)   __builtin_expect(!!(x), 0)
+#else
+#define PX_NOINLINE
+#define PX_ALWAYS_INLINE inline
+#define PX_LIKELY(x)     (x)
+#define PX_UNLIKELY(x)   (x)
+#endif
+
+/* PX_PROF(statement): only in a -DPX_PROFILE build (see PxProfile) */
+#ifdef PX_PROFILE
+#define PX_PROF(x) do { x; } while (0)
+#else
+#define PX_PROF(x) ((void)0)
+#endif
 #define PX_COUNTOF(a) ((int)(sizeof(a) / sizeof((a)[0])))
 
 /* DEFINE_METHOD kinds */
@@ -1039,5 +1077,24 @@ typedef enum PxOp {
 extern const uint8_t px_op_size[OP__COUNT];   /* operand bytes */
 extern const int8_t  px_op_effect[OP__COUNT];
 extern const char   *px_op_name[OP__COUNT];
+
+/* The prototype a primitive's properties come from (String.prototype for
+ * a string...), or NULL (undefined, null, symbols): property access on
+ * primitives goes through the inline caches like an object's. */
+static inline PxObject *px_prim_proto(PxVM *vm, PxValue v) {
+    PxValue p;
+    if (px_is_smi(v)) p = vm->protos[PX_PROTO_NUMBER];
+    else if (px_is_ptr(v)) {
+        PxType t = px_type_of(v);
+        if (t == PX_T_STRING || t == PX_T_ROPE) p = vm->protos[PX_PROTO_STRING];
+        else if (t == PX_T_NUMBER) p = vm->protos[PX_PROTO_NUMBER];
+        else return NULL;
+    } else if (v == PX_TRUE || v == PX_FALSE) {
+        p = vm->protos[PX_PROTO_BOOLEAN];
+    } else {
+        return NULL;
+    }
+    return px_is_obj(p) ? (PxObject *)px_ptr(p) : NULL;
+}
 
 #endif

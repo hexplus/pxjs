@@ -212,6 +212,9 @@ void *px_alloc(PxVM *vm, PxType type, size_t bytes) {
     memset(p, 0, bytes);
     ((PxCell *)p)->hdr = PX_HDR(type, bytes / 8u);
     vm->bytes_since_gc += bytes;
+    PX_PROF(vm->prof.alloc_count[type]++; vm->prof.alloc_bytes[type] += bytes;
+            if (vm->live_after_gc + vm->bytes_since_gc > vm->prof.peak_used)
+                vm->prof.peak_used = vm->live_after_gc + vm->bytes_since_gc);
     return p;
 }
 
@@ -242,6 +245,7 @@ PxValue px_box_number(PxVM *vm, double d) {
     n->d = d;
     return px_from_ptr(n);
 init:
+    PX_PROF(vm->prof.alloc_count[PX_T_NUMBER]++; vm->prof.alloc_bytes[PX_T_NUMBER] += sizeof(PxNumber));
     n->hdr = PX_HDR(PX_T_NUMBER, sizeof(PxNumber) / 8u);
     n->pad = 0;
     n->d   = d;
@@ -612,6 +616,9 @@ void px_collect(PxVM *vm) {
     uint8_t *p, *run = NULL;
     size_t   live = 0, cells = 0;
     uint64_t t0 = vm->now_us ? vm->now_us() : 0;
+#ifdef PX_PROFILE
+    size_t used_before = vm->live_after_gc + vm->bytes_since_gc;
+#endif
 
     if (vm->in_gc) return;
     vm->in_gc = 1;
@@ -671,6 +678,9 @@ void px_collect(PxVM *vm) {
     vm->gc_threshold = live > GC_MIN_THRESHOLD ? live : GC_MIN_THRESHOLD;
     vm->gc_count++;
     if (vm->now_us) vm->last_gc_us = vm->now_us() - t0;
+    PX_PROF(vm->prof.gc_count++; vm->prof.gc_us_total += vm->last_gc_us;
+            if (vm->last_gc_us > vm->prof.gc_us_max) vm->prof.gc_us_max = vm->last_gc_us;
+            if (used_before > live) vm->prof.gc_reclaimed += used_before - live);
     vm->in_gc = 0;
 }
 

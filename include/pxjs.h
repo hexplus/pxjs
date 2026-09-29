@@ -232,6 +232,27 @@ void px_gc(PxVM *vm);
 void px_mem_stats(PxVM *vm, PxMemStats *out);
 void px_set_clock(PxVM *vm, uint64_t (*now_us)(void));
 
+/* Performance counters, kept only by a build with -DPX_PROFILE (make
+ * PROFILE=1); px_profile() returns NULL in any other build, which pays
+ * nothing for them. alloc_* are indexed by the engine's cell type (named by
+ * px_profile_type_name), op_count by opcode (px_profile_op_name). GC times
+ * need a clock (px_set_clock). */
+typedef struct PxProfile {
+    uint32_t alloc_count[32];
+    uint64_t alloc_bytes[32];
+    uint32_t gc_count;
+    uint64_t gc_us_total, gc_us_max;
+    uint64_t gc_reclaimed; /* bytes freed by all collections */
+    size_t   peak_used;    /* the most bytes in use between collections */
+    uint32_t ic_own_hit, ic_proto_hit, ic_get_miss, ic_set_hit, ic_set_miss;
+    uint32_t native_to_js; /* px_call into JS functions */
+    uint32_t op_count[256];
+} PxProfile;
+const PxProfile *px_profile(PxVM *vm);
+void             px_profile_reset(PxVM *vm);
+const char      *px_profile_type_name(int type);
+const char      *px_profile_op_name(int op);
+
 #ifdef __cplusplus
 }
 #endif

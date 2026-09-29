@@ -494,38 +494,53 @@ static PxClosure *make_closure(PxVM *vm, PxProto *p, PxFrame *f) {
 
 /* Sets up a frame for closure `fn` whose call occupies callee[0] (this),
  * callee[1] (fn), callee[2..] (args); sp is just past the args. */
-static int push_frame(PxVM *vm, PxClosure *fn, PxValue *callee, int argc, PxValue this_val, PxValue new_target,
-                      int construct, int boundary) {
+/* The `arguments` object and the rest array of a new frame (the cold part
+ * of push_frame): built while the arguments are still on the stack (and
+ * covered by vm->sp, so rooted). */
+static PX_NOINLINE int frame_arrays(PxVM *vm, PxProto *p, PxValue *base, int argc, PxValue *restp, PxValue *argsp) {
+    PxValue rest = PX_UNDEFINED, args = PX_UNDEFINED;
+    int     i;
+    vm->sp = base + argc;
+    PX_ROOT(vm, rest);
+    PX_ROOT(vm, args);
+    if (p->flags & PX_PROTO_ARGUMENTS) {
+        args = px_array_new(vm, (uint32_t)argc);
+        for (i = 0; args != PX_EXCEPTION && i < argc; i++)
+            if (px_array_push(vm, args, base[i]) < 0) args = PX_EXCEPTION;
+    }
+    if (args != PX_EXCEPTION && (p->flags & PX_PROTO_REST)) {
+        int from = p->nparams;
+        rest     = px_array_new(vm, argc > from ? (uint32_t)(argc - from) : 0);
+        for (i = from; rest != PX_EXCEPTION && i < argc; i++)
+            if (px_array_push(vm, rest, base[i]) < 0) rest = PX_EXCEPTION;
+    }
+    px_pop_roots(vm, 2);
+    if (args == PX_EXCEPTION || rest == PX_EXCEPTION) return -1;
+    *restp = rest;
+    *argsp = args;
+    return 0;
+}
+
+static PX_NOINLINE int stack_overflow(PxVM *vm) {
+    px_throw_error(vm, PX_RANGE_ERROR, "Maximum call stack size exceeded");
+    return -1;
+}
+
+/* A new frame for fn, its arguments at callee + 2. Inline: every JS call
+ * goes through it; the rare parts are the functions above. */
+static PX_ALWAYS_INLINE int push_frame(PxVM *vm, PxClosure *fn, PxValue *callee, int argc, PxValue this_val,
+                                       PxValue new_target, int construct, int boundary) {
     PxProto *p    = fn->proto;
     PxValue *base = callee + 2;
     PxValue  rest = PX_UNDEFINED, args = PX_UNDEFINED;
     PxFrame *f;
     int      i;
 
-    if (vm->nframes >= vm->max_frames || base + p->nlocals + p->max_stack + 2 >= vm->stack_end) {
-        px_throw_error(vm, PX_RANGE_ERROR, "Maximum call stack size exceeded");
+    if (PX_UNLIKELY(vm->nframes >= vm->max_frames || base + p->nlocals + p->max_stack + 2 >= vm->stack_end))
+        return stack_overflow(vm);
+    if (PX_UNLIKELY(p->flags & (PX_PROTO_REST | PX_PROTO_ARGUMENTS)) &&
+        frame_arrays(vm, p, base, argc, &rest, &args) < 0)
         return -1;
-    }
-    if (p->flags & (PX_PROTO_REST | PX_PROTO_ARGUMENTS)) {
-        /* Build the arrays while the arguments are still on the stack
-         * (and covered by vm->sp, so rooted). */
-        vm->sp = base + argc;
-        PX_ROOT(vm, rest);
-        PX_ROOT(vm, args);
-        if (p->flags & PX_PROTO_ARGUMENTS) {
-            args = px_array_new(vm, (uint32_t)argc);
-            for (i = 0; args != PX_EXCEPTION && i < argc; i++)
-                if (px_array_push(vm, args, base[i]) < 0) args = PX_EXCEPTION;
-        }
-        if (args != PX_EXCEPTION && (p->flags & PX_PROTO_REST)) {
-            int from = p->nparams;
-            rest     = px_array_new(vm, argc > from ? (uint32_t)(argc - from) : 0);
-            for (i = from; rest != PX_EXCEPTION && i < argc; i++)
-                if (px_array_push(vm, rest, base[i]) < 0) rest = PX_EXCEPTION;
-        }
-        px_pop_roots(vm, 2);
-        if (args == PX_EXCEPTION || rest == PX_EXCEPTION) return -1;
-    }
     for (i = argc < p->nparams ? argc : p->nparams; i < p->nlocals; i++) base[i] = PX_UNDEFINED;
     if (p->self_slot != 0xFF) base[p->self_slot] = px_from_ptr(fn);
     if (p->flags & PX_PROTO_REST) base[p->nparams] = rest;
@@ -885,6 +900,29 @@ PxValue px_call(PxVM *vm, PxValue fn, PxValue this_val, int argc, PxValue *argv)
     PxValue *callee = vm->sp, r;
     int      i;
 
+    /* The common case first, with the fewest checks: a plain JS function
+     * (the host's callbacks: timers, input, UI events, promise jobs). The
+     * same steps as the general path's closure case below. */
+    if (px_is_ptr(fn) && px_type_of(fn) == PX_T_CLOSURE) {
+        PxClosure *c = (PxClosure *)px_ptr(fn);
+        if (!(c->obj.flags & PX_OBJ_CLASS_CTOR) && !(c->proto->flags & (PX_PROTO_GENERATOR | PX_PROTO_ASYNC)) &&
+            vm->native_depth < vm->max_native_depth && callee + 2 + argc + 8 < vm->stack_end) {
+            callee[0] = this_val;
+            callee[1] = fn;
+            for (i = 0; i < argc; i++) callee[2 + i] = argv[i];
+            vm->sp = callee + 2 + argc;
+            if (push_frame(vm, c, callee, argc, this_val, PX_UNDEFINED, 0, 1) < 0) {
+                vm->sp = callee;
+                return PX_EXCEPTION;
+            }
+            PX_PROF(vm->prof.native_to_js++);
+            vm->native_depth++;
+            r = run(vm, vm->nframes - 1, 0);
+            vm->native_depth--;
+            vm->sp = callee;
+            return r;
+        }
+    }
     if (!px_is_callable(fn)) return px_throw_error(vm, PX_TYPE_ERROR, "not a function");
     if (callee + 2 + argc + 8 >= vm->stack_end)
         return px_throw_error(vm, PX_RANGE_ERROR, "Maximum call stack size exceeded");
@@ -929,6 +967,7 @@ PxValue px_call(PxVM *vm, PxValue fn, PxValue this_val, int argc, PxValue *argv)
             vm->sp = callee;
             return r;
         }
+        PX_PROF(vm->prof.native_to_js++);
         vm->native_depth++;
         r = run(vm, vm->nframes - 1, 0);
         vm->native_depth--;
@@ -1424,11 +1463,31 @@ static PxValue key_of(PxVM *vm, PxValue k) {
 }
 
 static PxValue global_lookup(PxVM *vm, PxValue name, int *found) {
-    uint32_t attrs;
-    PxValue *slot = px_own_slot(vm, (PxObject *)px_ptr(vm->global), name, &attrs);
-    if (slot && !(attrs & PX_ATTR_ACCESSOR)) {
-        *found = 1;
-        return *slot;
+    uint32_t  attrs, h = ((uint32_t)name >> 3) & 63;
+    PxObject *g = (PxObject *)px_ptr(vm->global);
+    PxValue  *slot;
+    if (g->shape->flags & PX_SHAPE_DICT) {
+        /* the hint: the entry this name had last time, if it still has it */
+        PxDict  *d = (PxDict *)g->slots;
+        uint32_t i = vm->global_hint[h].index;
+        if (vm->global_hint[h].name == name && i < d->used && d->entries[i].key == name &&
+            !(d->entries[i].attrs & PX_ATTR_ACCESSOR)) {
+            *found = 1;
+            return d->entries[i].value;
+        }
+        slot = px_own_slot(vm, g, name, &attrs);
+        if (slot && !(attrs & PX_ATTR_ACCESSOR)) {
+            vm->global_hint[h].name  = name;
+            vm->global_hint[h].index = (uint32_t)((PxDictEntry *)(void *)((char *)slot - offsetof(PxDictEntry, value)) - d->entries);
+            *found = 1;
+            return *slot;
+        }
+    } else {
+        slot = px_own_slot(vm, g, name, &attrs);
+        if (slot && !(attrs & PX_ATTR_ACCESSOR)) {
+            *found = 1;
+            return *slot;
+        }
     }
     *found = px_has(vm, vm->global, name);
     return *found ? px_get(vm, vm->global, name) : PX_UNDEFINED;
@@ -1614,6 +1673,7 @@ static PxValue run(PxVM *vm, uint32_t entry, int throw_now) {
     if (throw_now) goto exception;
     for (;;) {
         op = (PxOp)*pc++;
+        PX_PROF(vm->prof.op_count[op]++);
         switch (op) {
         case OP_NOP: break;
         case OP_UNDEF: PUSH(PX_UNDEFINED); break;
@@ -1740,7 +1800,18 @@ static PxValue run(PxVM *vm, uint32_t entry, int throw_now) {
             break;
         }
         case OP_SET_GLOBAL: {
-            PxValue name = CONSTS[READ_U16()];
+            PxValue   name = CONSTS[READ_U16()];
+            PxObject *g    = (PxObject *)px_ptr(vm->global);
+            if (g->shape->flags & PX_SHAPE_DICT) {
+                /* a writable data property where global_lookup last found it */
+                PxDict  *d = (PxDict *)g->slots;
+                uint32_t h = ((uint32_t)name >> 3) & 63, i = vm->global_hint[h].index;
+                if (vm->global_hint[h].name == name && i < d->used && d->entries[i].key == name &&
+                    (d->entries[i].attrs & (PX_ATTR_ACCESSOR | PX_ATTR_WRITABLE)) == PX_ATTR_WRITABLE) {
+                    d->entries[i].value = TOP();
+                    break;
+                }
+            }
             SAVE();
             if (!px_has(vm, vm->global, name)) {
                 char buf[64];
@@ -1769,20 +1840,30 @@ static PxValue run(PxVM *vm, uint32_t entry, int throw_now) {
             PxValue  key = CONSTS[READ_U16()], obj = TOP(), v;
             uint32_t ici = READ_U16();
             PxIC    *ic  = ici != 0xFFFF ? (PxIC *)(void *)f->fn->proto->ics->data + ici : NULL;
-            if (ic && ic->epoch == vm->shape_epoch && px_is_obj(obj)) {
-                PxObject *o = (PxObject *)px_ptr(obj);
-                if (o->shape == ic->shape) {
+            if (ic && ic->epoch == vm->shape_epoch) {
+                /* a primitive looks up from its prototype (cached as that
+                 * object's own property) */
+                PxObject *o = px_is_obj(obj) ? (PxObject *)px_ptr(obj) : px_prim_proto(vm, obj);
+                if (o && o->shape == ic->shape) {
                     if (!ic->holder_shape) {
                         v = *px_slot_at(o, ic->slot);
+                        PX_PROF(vm->prof.ic_own_hit++);
                         goto got_prop;
                     }
                     if (o->shape->proto->shape == ic->holder_shape) {
                         v = *px_slot_at(o->shape->proto, ic->slot);
+                        PX_PROF(vm->prof.ic_proto_hit++);
                         goto got_prop;
                     }
                 }
             }
+            if (key == vm->atom[PX_ATOM_length] && px_is_ptr(obj) &&
+                (px_type_of(obj) == PX_T_STRING || px_type_of(obj) == PX_T_ROPE)) {
+                v = px_from_smi((int32_t)px_str_len(obj));
+                goto got_prop;
+            }
             SAVE();
+            PX_PROF(vm->prof.ic_get_miss++);
             v = px_get_ic(vm, obj, key, ic);
             CHECK(v);
         got_prop:
@@ -1797,8 +1878,10 @@ static PxValue run(PxVM *vm, uint32_t entry, int throw_now) {
             if (ic && ic->epoch == vm->shape_epoch && !ic->holder_shape && px_is_obj(obj) &&
                 ((PxObject *)px_ptr(obj))->shape == ic->shape) {
                 *px_slot_at((PxObject *)px_ptr(obj), ic->slot) = sp[-1];
+                PX_PROF(vm->prof.ic_set_hit++);
             } else {
                 SAVE();
+                PX_PROF(vm->prof.ic_set_miss++);
                 if (px_set_ic(vm, obj, key, sp[-1], ic) < 0) THROW();
             }
             sp[-2] = sp[-1];
@@ -2360,6 +2443,37 @@ static PxValue run(PxVM *vm, uint32_t entry, int throw_now) {
             int16_t off = READ_S16();
             PxValue v = POP();
             if (v == PX_FALSE || (v != PX_TRUE && !px_truthy(v))) pc += off;
+            break;
+        }
+        case OP_LT_JUMP_IF_FALSE:
+        case OP_LE_JUMP_IF_FALSE:
+        case OP_GT_JUMP_IF_FALSE:
+        case OP_GE_JUMP_IF_FALSE: {
+            int16_t off = READ_S16();
+            PxValue a = sp[-2], b = sp[-1];
+            int     r;
+            if (px_is_smi(a) && px_is_smi(b)) {
+                int32_t x = px_smi(a), y = px_smi(b);
+                r = op == OP_LT_JUMP_IF_FALSE ? x < y : op == OP_LE_JUMP_IF_FALSE ? x <= y
+                    : op == OP_GT_JUMP_IF_FALSE ? x > y : x >= y;
+            } else {
+                SAVE();
+                r = compare(vm, op == OP_LT_JUMP_IF_FALSE ? OP_LT : op == OP_LE_JUMP_IF_FALSE ? OP_LE
+                                : op == OP_GT_JUMP_IF_FALSE ? OP_GT : OP_GE, a, b);
+                if (r < 0) THROW();
+            }
+            sp -= 2;
+            if (!r) pc += off;
+            break;
+        }
+        case OP_SEQ_JUMP_IF_FALSE:
+        case OP_SNE_JUMP_IF_FALSE: {
+            int16_t off = READ_S16();
+            PxValue a = sp[-2], b = sp[-1];
+            int     r = a == b ? !(px_is_ptr(a) && px_type_of(a) == PX_T_NUMBER && isnan(px_num(a)))
+                               : px_strict_equals(vm, a, b);
+            sp -= 2;
+            if (op == OP_SEQ_JUMP_IF_FALSE ? !r : r) pc += off;
             break;
         }
         case OP_JUMP_IF_TRUE: {

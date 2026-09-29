@@ -633,12 +633,17 @@ static int ic_key_ok(PxVM *vm, PxValue key) {
 /* Objects whose properties are all in their shape (for ic_key_ok keys). */
 static int ic_type_ok(const PxObject *o) {
     PxType t = px_hdr_type(o->hdr);
-    return (t == PX_T_OBJECT || t == PX_T_ARRAY) && !(o->shape->flags & PX_SHAPE_DICT);
+    /* a String object's other own properties (indices, length) are not
+     * keys the caches take (ic_key_ok) */
+    return (t == PX_T_OBJECT || t == PX_T_ARRAY || t == PX_T_BOXED) && !(o->shape->flags & PX_SHAPE_DICT);
 }
 
 PxValue px_get_ic(PxVM *vm, PxValue obj, PxValue key, PxIC *ic) {
-    if (ic && px_is_obj(obj) && ic_key_ok(vm, key)) {
-        PxObject *o = (PxObject *)px_ptr(obj);
+    /* a primitive: from its prototype, as that object's own property (the
+     * receiver matters only to getters, which are never cached) */
+    PxObject *po = ic && !px_is_obj(obj) ? px_prim_proto(vm, obj) : NULL;
+    if (ic && (po || px_is_obj(obj)) && ic_key_ok(vm, key)) {
+        PxObject *o = po ? po : (PxObject *)px_ptr(obj);
         uint32_t  idx, attrs;
         if (ic_type_ok(o)) {
             if (shape_find(o->shape, key, &idx, &attrs)) {

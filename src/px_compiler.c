@@ -673,9 +673,28 @@ static void emit_op_u16(Compiler *C, PxOp op, int v) {
 }
 
 /* Returns the position of the 16-bit offset, to patch. */
+static void emit_u16(Compiler *C, int v);
+
 static int emit_jump(Compiler *C, PxOp op) {
+    FuncState *fs = C->fs;
+    int        last;
+    /* LT..GE; JUMP_IF_FALSE -> one fused instruction, when no jump lands
+     * between the two and no line-table entry points there */
+    if (op == OP_JUMP_IF_FALSE && fs->nops > 0 && fs->last_target < (int)fs->len &&
+        (int)fs->last_pc <= fs->ops[fs->nops - 1]) {
+        last = op_back(fs, 1);
+        if (last == OP_LT || last == OP_LE || last == OP_GT || last == OP_GE || last == OP_SEQ || last == OP_SNE) {
+            fs->code[fs->ops[fs->nops - 1]] =
+                (uint8_t)(last == OP_LT ? OP_LT_JUMP_IF_FALSE : last == OP_LE ? OP_LE_JUMP_IF_FALSE
+                          : last == OP_GT ? OP_GT_JUMP_IF_FALSE : last == OP_GE ? OP_GE_JUMP_IF_FALSE
+                          : last == OP_SEQ ? OP_SEQ_JUMP_IF_FALSE : OP_SNE_JUMP_IF_FALSE);
+            emit_u16(C, 0);
+            adjust(C, -1); /* the compare's result, which the jump takes */
+            return (int)fs->len - 2;
+        }
+    }
     emit_op_u16(C, op, 0);
-    return (int)C->fs->len - 2;
+    return (int)fs->len - 2;
 }
 
 static void patch_to(Compiler *C, int at, int target) {

@@ -110,24 +110,165 @@ static int out_number(PxVM *vm, Out *o, double d) {
 
 /* ============================================================ stringify */
 
+/* The output: Latin-1 code units until a character above U+00FF comes,
+ * then UTF-16. One buffer, doubled as it fills, and one string made from
+ * it at the end (no UTF-8 round trip, no string per fragment). */
+typedef struct SB {
+    uint8_t *d; /* uint8_t[cap], or uint16_t[cap] once wide */
+    uint32_t n, cap;
+    int      wide;
+    int      err; /* 1: out of memory, 2: longer than a string can be */
+} SB;
+
+static int sb_reserve(SB *b, uint32_t more) {
+    uint32_t need = b->n + more, cap;
+    uint8_t *nd;
+    if (b->err) return -1;
+    if (need <= b->cap) return 0;
+    if (need < b->n || need > (1u << 28)) {
+        b->err = 2;
+        return -1;
+    }
+    cap = b->cap ? b->cap * 2 : 256;
+    while (cap < need) cap *= 2;
+    nd = (uint8_t *)realloc(b->d, (size_t)cap << b->wide);
+    if (!nd) {
+        b->err = 1;
+        return -1;
+    }
+    b->d   = nd;
+    b->cap = cap;
+    return 0;
+}
+
+static int sb_widen(SB *b) {
+    uint32_t  cap = b->cap ? b->cap : 256, i;
+    uint16_t *w;
+    if (b->err) return -1;
+    w = (uint16_t *)malloc((size_t)cap * 2u);
+    if (!w) {
+        b->err = 1;
+        return -1;
+    }
+    for (i = 0; i < b->n; i++) w[i] = b->d[i];
+    free(b->d);
+    b->d    = (uint8_t *)w;
+    b->cap  = cap;
+    b->wide = 1;
+    return 0;
+}
+
+/* Latin-1 units (ASCII text included) */
+static void sb_l1(SB *b, const uint8_t *s, uint32_t len) {
+    uint32_t i;
+    if (sb_reserve(b, len) < 0) return;
+    if (!b->wide) memcpy(b->d + b->n, s, len);
+    else
+        for (i = 0; i < len; i++) ((uint16_t *)b->d)[b->n + i] = s[i];
+    b->n += len;
+}
+
+#define sb_lit(b, s) sb_l1((b), (const uint8_t *)(s), (uint32_t)(sizeof(s) - 1))
+
+static void sb_unit(SB *b, uint16_t c) {
+    if (c > 0xFF && !b->wide && sb_widen(b) < 0) return;
+    if (sb_reserve(b, 1) < 0) return;
+    if (b->wide) ((uint16_t *)b->d)[b->n++] = c;
+    else b->d[b->n++] = (uint8_t)c;
+}
+
+/* The escape for c: '"', '\\' or a control character; or \uXXXX for a
+ * lone surrogate (well-formed JSON.stringify) */
+static void sb_escape(SB *b, uint16_t c) {
+    static const char hex[] = "0123456789abcdef";
+    char e[6];
+    switch (c) {
+    case '"': sb_lit(b, "\\\""); return;
+    case '\\': sb_lit(b, "\\\\"); return;
+    case '\b': sb_lit(b, "\\b"); return;
+    case '\f': sb_lit(b, "\\f"); return;
+    case '\n': sb_lit(b, "\\n"); return;
+    case '\r': sb_lit(b, "\\r"); return;
+    case '\t': sb_lit(b, "\\t"); return;
+    }
+    e[0] = '\\';
+    e[1] = 'u';
+    e[2] = hex[(c >> 12) & 15];
+    e[3] = hex[(c >> 8) & 15];
+    e[4] = hex[(c >> 4) & 15];
+    e[5] = hex[c & 15];
+    sb_l1(b, (const uint8_t *)e, 6);
+}
+
+/* QuoteJSONString: runs of plain characters are copied at once */
+static int sb_json_string(PxVM *vm, SB *b, PxValue v) {
+    PxString *s = px_str_flat(vm, v);
+    uint32_t  i, run;
+    if (!s) return -1;
+    sb_unit(b, '"');
+    if (!s->wide) {
+        const uint8_t *c = px_str_l1(s);
+        for (i = 0; i < s->len;) {
+            run = i;
+            while (i < s->len && c[i] >= 0x20 && c[i] != '"' && c[i] != '\\') i++;
+            if (i > run) sb_l1(b, c + run, i - run);
+            if (i < s->len) sb_escape(b, c[i++]);
+        }
+    } else {
+        const uint16_t *c = px_str_u16(s);
+        for (i = 0; i < s->len; i++) {
+            uint16_t ch = c[i];
+            if (ch >= 0xD800 && ch <= 0xDFFF) {
+                if (ch <= 0xDBFF && i + 1 < s->len && c[i + 1] >= 0xDC00 && c[i + 1] <= 0xDFFF) {
+                    sb_unit(b, ch);
+                    sb_unit(b, c[++i]);
+                } else {
+                    sb_escape(b, ch);
+                }
+            } else if (ch < 0x20 || ch == '"' || ch == '\\') {
+                sb_escape(b, ch);
+            } else {
+                sb_unit(b, ch);
+            }
+        }
+    }
+    sb_unit(b, '"');
+    return 0;
+}
+
+/* a finite number, written without making a string */
+static void sb_number(SB *b, PxValue v) {
+    char buf[40];
+    if (px_is_smi(v)) {
+        sb_l1(b, (const uint8_t *)buf, (uint32_t)px_itoa(px_smi(v), buf));
+    } else {
+        double d = px_num(v);
+        if (d == 0) sb_lit(b, "0"); /* -0 too */
+        else sb_l1(b, (const uint8_t *)buf, (uint32_t)px_fmt_number(d, buf, sizeof buf));
+    }
+}
+
 typedef struct JCtx {
     PxVM    *vm;
-    Out      out;
+    SB       out;
     PxValue  replacer;  /* function or undefined */
+    PxValue  to_json;   /* the key "toJSON" (rooted) */
     PxVec   *allow;     /* allowlist of keys, or NULL */
     uint32_t nallow;
-    char     indent[64]; /* up to 10 code units, as UTF-8 */
+    uint16_t indent[10];
+    int      nindent;
     PxValue  stack[JSON_MAX_DEPTH];
     int      depth;
 } JCtx;
 
-static int json_value(JCtx *c, PxValue holder, PxValue key, PxValue v, int *wrote);
+static int json_value(JCtx *c, PxValue holder, PxValue key, PxIdx idx, PxValue v, int *wrote);
 
 static void newline(JCtx *c) {
-    int i;
-    if (!c->indent[0]) return;
-    out_str(&c->out, "\n");
-    for (i = 0; i < c->depth; i++) out_str(&c->out, c->indent);
+    int i, j;
+    if (!c->nindent) return;
+    sb_unit(&c->out, '\n');
+    for (i = 0; i < c->depth; i++)
+        for (j = 0; j < c->nindent; j++) sb_unit(&c->out, c->indent[j]);
 }
 
 static int json_object(JCtx *c, PxValue v) {
@@ -148,25 +289,32 @@ static int json_object(JCtx *c, PxValue v) {
             return -1;
         }
     c->stack[c->depth++] = v;
-    out_str(&c->out, is_arr ? "[" : "{");
+    sb_unit(&c->out, is_arr ? '[' : '{');
     if (is_arr) {
         PxIdx len, k;
         if (px_length_of(vm, v, &len) < 0) return -1;
         for (k = 0; k < len; k++) {
-            PxValue item = px_get_index(vm, v, k), kk;
+            PxValue item = 0;
             int     wrote;
+            /* a dense element directly; holes, sparse arrays and Proxies
+             * the general way. Checked each time: toJSON may change v. */
+            if (px_type_of(v) == PX_T_ARRAY) {
+                PxArray *a = (PxArray *)px_ptr(v);
+                if (a->elems && k < a->length && k < a->elems->cap && a->elems->items[k] != PX_HOLE)
+                    item = a->elems->items[k];
+            }
+            if (!item) item = px_get_index(vm, v, k);
             if (item == PX_EXCEPTION) return -1;
-            if (!first) out_str(&c->out, ",");
+            if (!first) sb_unit(&c->out, ',');
             first = 0;
             newline(c);
             PX_ROOT(vm, item);
-            kk = px_number_to_string(vm, k, 10);
-            if (kk == PX_EXCEPTION || json_value(c, v, kk, item, &wrote) < 0) {
+            if (json_value(c, v, 0, k, item, &wrote) < 0) {
                 px_pop_roots(vm, 1);
                 return -1;
             }
             px_pop_roots(vm, 1);
-            if (!wrote) out_str(&c->out, "null");
+            if (!wrote) sb_lit(&c->out, "null");
         }
     } else {
         if (c->allow) {
@@ -179,19 +327,20 @@ static int json_object(JCtx *c, PxValue v) {
         kv = px_from_ptr(keys);
         PX_ROOT(vm, kv);
         for (i = 0; i < n; i++) {
-            PxValue k = keys->items[i], item, ik;
-            size_t  mark = c->out.n;
-            int     wrote;
+            PxValue  k = keys->items[i], item, ik;
+            uint32_t mark = c->out.n;
+            int      wrote;
             ik = px_intern(vm, k);
             if (ik == PX_EXCEPTION) goto fail;
             item = px_get(vm, v, ik);
             if (item == PX_EXCEPTION) goto fail;
-            if (!first) out_str(&c->out, ",");
+            if (!first) sb_unit(&c->out, ',');
             newline(c);
-            if (out_js_string(vm, &c->out, k, '"') < 0) goto fail;
-            out_str(&c->out, c->indent[0] ? ": " : ":");
+            if (sb_json_string(vm, &c->out, k) < 0) goto fail;
+            if (c->nindent) sb_lit(&c->out, ": ");
+            else sb_unit(&c->out, ':');
             PX_ROOT(vm, item);
-            if (json_value(c, v, k, item, &wrote) < 0) {
+            if (json_value(c, v, k, 0, item, &wrote) < 0) {
                 px_pop_roots(vm, 1);
                 goto fail;
             }
@@ -199,7 +348,6 @@ static int json_object(JCtx *c, PxValue v) {
             if (!wrote) {
                 /* undefined/function values: the whole member is dropped */
                 c->out.n = mark;
-                if (c->out.d) c->out.d[mark] = '\0';
                 continue;
             }
             first = 0;
@@ -208,14 +356,16 @@ static int json_object(JCtx *c, PxValue v) {
     }
     c->depth--;
     if (!first) newline(c);
-    out_str(&c->out, is_arr ? "]" : "}");
+    sb_unit(&c->out, is_arr ? ']' : '}');
     return 0;
 fail:
     px_pop_roots(vm, 1);
     return -1;
 }
 
-static int json_value(JCtx *c, PxValue holder, PxValue key, PxValue v, int *wrote) {
+/* SerializeJSONProperty. key 0: the array index idx, made a string only
+ * if toJSON or the replacer needs it. */
+static int json_value(JCtx *c, PxValue holder, PxValue key, PxIdx idx, PxValue v, int *wrote) {
     PxVM *vm = c->vm;
     int   r  = 0;
     *wrote   = 1;
@@ -223,18 +373,20 @@ static int json_value(JCtx *c, PxValue holder, PxValue key, PxValue v, int *wrot
     PX_ROOT(vm, key);
     PX_ROOT(vm, v);
     if (px_is_obj(v)) {
-        PxValue k = px_intern_cstr(vm, "toJSON"), f;
-        if (k == PX_EXCEPTION) goto fail;
-        f = px_get(vm, v, k);
+        PxValue f = px_get(vm, v, c->to_json);
         if (f == PX_EXCEPTION) goto fail;
         if (px_is_callable(f)) {
+            if (!key && (key = px_number_to_string(vm, (double)idx, 10)) == PX_EXCEPTION) goto fail;
             v = px_call(vm, f, v, 1, &key);
             if (v == PX_EXCEPTION) goto fail;
         }
     }
     if (c->replacer != PX_UNDEFINED) {
-        PxValue args[2] = {key, v};
-        v               = px_call(vm, c->replacer, holder, 2, args);
+        PxValue args[2];
+        if (!key && (key = px_number_to_string(vm, (double)idx, 10)) == PX_EXCEPTION) goto fail;
+        args[0] = key;
+        args[1] = v;
+        v       = px_call(vm, c->replacer, holder, 2, args);
         if (v == PX_EXCEPTION) goto fail;
     }
     if (px_is_obj(v) && px_type_of(v) == PX_T_BOXED) {
@@ -252,18 +404,21 @@ static int json_value(JCtx *c, PxValue holder, PxValue key, PxValue v, int *wrot
         }
         if (v == PX_EXCEPTION) goto fail;
     }
-    if (v == PX_NULL) out_str(&c->out, "null");
-    else if (v == PX_TRUE) out_str(&c->out, "true");
-    else if (v == PX_FALSE) out_str(&c->out, "false");
+    if (v == PX_NULL) sb_lit(&c->out, "null");
+    else if (v == PX_TRUE) sb_lit(&c->out, "true");
+    else if (v == PX_FALSE) sb_lit(&c->out, "false");
     else if (px_is_num(v)) {
-        double d = px_num(v);
-        if (isfinite(d)) r = out_number(vm, &c->out, d == 0 ? 0 : d);
-        else out_str(&c->out, "null");
-    } else if (px_is_str(v)) r = out_js_string(vm, &c->out, v, '"');
+        if (px_is_smi(v) || isfinite(px_num(v))) sb_number(&c->out, v);
+        else sb_lit(&c->out, "null");
+    } else if (px_is_str(v)) r = sb_json_string(vm, &c->out, v);
     else if (px_is_obj(v) && !px_is_callable(v)) r = json_object(c, v);
     else *wrote = 0; /* undefined, functions, symbols */
     px_pop_roots(vm, 3);
-    if (c->out.oom) return px_throw_oom(vm), -1;
+    if (c->out.err) {
+        if (c->out.err == 2) px_throw_error(vm, PX_RANGE_ERROR, "JSON.stringify: result too long");
+        else px_throw_oom(vm);
+        return -1;
+    }
     return r;
 fail:
     px_pop_roots(vm, 3);
@@ -281,6 +436,9 @@ PxValue px_json_stringify(PxVM *vm, PxValue v, PxValue replacer, PxValue space) 
     PX_ROOT(vm, v);
     PX_ROOT(vm, allowv);
     PX_ROOT(vm, space);
+    PX_ROOT(vm, c.to_json);
+    c.to_json = px_intern_cstr(vm, "toJSON");
+    if (c.to_json == PX_EXCEPTION) goto fail;
     if (c.replacer == PX_UNDEFINED && px_is_obj(replacer)) {
         /* an array of property names: strings, numbers and their objects, once each */
         PxIdx len, k;
@@ -331,32 +489,34 @@ PxValue px_json_stringify(PxVM *vm, PxValue v, PxValue replacer, PxValue space) 
         double n = px_num(space);
         int    i;
         if (n > 10) n = 10;
-        for (i = 0; i < (int)n; i++) c.indent[i] = ' ';
+        for (i = 0; i < (int)n; i++) c.indent[c.nindent++] = ' ';
     } else if (px_is_str(space)) {
-        PxValue s10 = px_str_len(space) > 10 ? px_str_slice(vm, space, 0, 10) : space;
-        if (s10 == PX_EXCEPTION) goto fail;
-        px_str_to_utf8(vm, s10, c.indent, sizeof c.indent);
+        PxString *fs = px_str_flat(vm, space);
+        uint32_t  i;
+        if (!fs) goto fail;
+        for (i = 0; i < fs->len && i < 10; i++) c.indent[c.nindent++] = px_str_at(fs, i);
     }
     holder = px_object_new(vm);
     if (holder == PX_EXCEPTION) goto fail;
     PX_ROOT(vm, holder);
     if (px_define(vm, holder, vm->atom[PX_ATOM_empty], v, PX_ATTR_DEFAULT) < 0 ||
-        json_value(&c, holder, vm->atom[PX_ATOM_empty], v, &wrote) < 0) {
+        json_value(&c, holder, vm->atom[PX_ATOM_empty], 0, v, &wrote) < 0) {
         px_pop_roots(vm, 1);
         goto fail;
     }
-    px_pop_roots(vm, 4);
+    px_pop_roots(vm, 5);
     if (!wrote) {
         free(c.out.d);
         return PX_UNDEFINED;
     }
-    r = px_str_from_utf8(vm, c.out.d ? c.out.d : "", c.out.n);
+    r = c.out.wide ? px_str_new_u16(vm, (const uint16_t *)c.out.d, c.out.n)
+                   : px_str_new_l1(vm, c.out.d, c.out.n);
     free(c.out.d);
     return r;
 fail1:
     px_pop_roots(vm, 1);
 fail:
-    px_pop_roots(vm, 3);
+    px_pop_roots(vm, 4);
     free(c.out.d);
     return PX_EXCEPTION;
 }
@@ -369,43 +529,78 @@ static PxValue json_stringify(PxVM *vm, PxValue t, int argc, PxValue *argv) {
 /* ============================================================ parse */
 
 typedef struct JParse {
-    PxVM     *vm;
-    PxString *s;
-    uint32_t  pos;
-    int       depth;
-    uint16_t *buf;
-    uint32_t  cap;
+    PxVM           *vm;
+    const uint8_t  *b8;  /* the text, Latin-1 ... */
+    const uint16_t *b16; /* ... or UTF-16 (the string stays rooted) */
+    int             wide;
+    uint32_t        len, pos;
+    int             depth;
+    uint16_t       *buf; /* strings with escapes are unescaped here */
+    uint32_t        cap;
 } JParse;
+
+#define JCH(p, i) ((p)->wide ? (p)->b16[i] : (p)->b8[i])
 
 static PxValue perr(JParse *p, const char *what) {
     return px_throw_error(p->vm, PX_SYNTAX_ERROR, "JSON.parse: %s at position %u", what, (unsigned)p->pos);
 }
 
-static uint16_t peek(JParse *p) { return p->pos < p->s->len ? px_str_at(p->s, p->pos) : 0; }
+static inline uint16_t peek(JParse *p) { return p->pos < p->len ? JCH(p, p->pos) : 0; }
 
-static void skip_ws(JParse *p) {
-    while (p->pos < p->s->len) {
-        uint16_t c = px_str_at(p->s, p->pos);
+static inline void skip_ws(JParse *p) {
+    while (p->pos < p->len) {
+        uint16_t c = JCH(p, p->pos);
         if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
         p->pos++;
     }
 }
 
+static const void *text_at(JParse *p, uint32_t i) {
+    return p->wide ? (const void *)(p->b16 + i) : (const void *)(p->b8 + i);
+}
+
 static PxValue parse_value(JParse *p);
 
-static PxValue parse_string(JParse *p) {
-    uint32_t n = 0;
-    p->pos++; /* " */
+/* A string, or with as_key its property key. Most JSON strings have no
+ * escapes: those are made straight from the text (a key usually without
+ * allocating at all: it is interned already). The rest are unescaped into
+ * p->buf. */
+static PxValue parse_string(JParse *p, int as_key) {
+    uint32_t start = ++p->pos, i = start, n;
+    if (!p->wide) {
+        const uint8_t *b = p->b8;
+        while (i < p->len && b[i] != '"' && b[i] != '\\' && b[i] >= 0x20) i++;
+    } else {
+        const uint16_t *b = p->b16;
+        while (i < p->len && b[i] != '"' && b[i] != '\\' && b[i] >= 0x20) i++;
+    }
+    if (i < p->len && JCH(p, i) == '"') {
+        p->pos = i + 1;
+        if (as_key) return px_intern_chars(p->vm, text_at(p, start), p->wide, i - start);
+        return p->wide ? px_str_new_u16(p->vm, p->b16 + start, i - start) : px_str_new_l1(p->vm, p->b8 + start, i - start);
+    }
+    /* the slow path, from the first escape (or the error) on */
+    n = i - start;
+    if (n > p->cap) {
+        uint16_t *nb = (uint16_t *)realloc(p->buf, (n + 64) * sizeof(uint16_t));
+        if (!nb) return px_throw_oom(p->vm);
+        p->buf = nb;
+        p->cap = n + 64;
+    }
+    for (i = 0; i < n; i++) p->buf[i] = JCH(p, start + i);
+    p->pos = start + n;
     for (;;) {
         uint16_t c;
-        if (p->pos >= p->s->len) return perr(p, "unterminated string");
-        c = px_str_at(p->s, p->pos++);
+        if (p->pos >= p->len) return perr(p, "unterminated string");
+        c = JCH(p, p->pos);
+        p->pos++;
         if (c == '"') break;
         if (c < 0x20) return perr(p, "control character in string");
         if (c == '\\') {
             uint16_t e;
-            if (p->pos >= p->s->len) return perr(p, "unterminated string");
-            e = px_str_at(p->s, p->pos++);
+            if (p->pos >= p->len) return perr(p, "unterminated string");
+            e = JCH(p, p->pos);
+            p->pos++;
             switch (e) {
             case '"': c = '"'; break;
             case '\\': c = '\\'; break;
@@ -440,36 +635,52 @@ static PxValue parse_string(JParse *p) {
         }
         p->buf[n++] = c;
     }
+    if (as_key) return px_intern_chars(p->vm, p->buf, 1, n);
     return px_str_new_u16(p->vm, p->buf, n);
 }
 
 static PxValue parse_number(JParse *p) {
-    uint32_t start = p->pos;
-    if (peek(p) == '-') p->pos++;
-    if (peek(p) == '0') p->pos++;
-    else if (peek(p) >= '1' && peek(p) <= '9')
-        while (peek(p) >= '0' && peek(p) <= '9') p->pos++;
-    else return perr(p, "invalid number");
+    uint32_t start = p->pos, digits = 0;
+    int      neg = 0, integer = 1;
+    int32_t  v   = 0;
+    if (peek(p) == '-') {
+        neg = 1;
+        p->pos++;
+    }
+    if (peek(p) == '0') {
+        p->pos++;
+        digits = 1;
+    } else if (peek(p) >= '1' && peek(p) <= '9') {
+        /* up to 9 digits accumulate exactly: below the SMI limit */
+        while (peek(p) >= '0' && peek(p) <= '9') {
+            if (++digits <= 9) v = v * 10 + (peek(p) - '0');
+            p->pos++;
+        }
+    } else {
+        return perr(p, "invalid number");
+    }
     if (peek(p) == '.') {
+        integer = 0;
         p->pos++;
         if (!(peek(p) >= '0' && peek(p) <= '9')) return perr(p, "invalid number");
         while (peek(p) >= '0' && peek(p) <= '9') p->pos++;
     }
     if ((peek(p) | 0x20) == 'e') {
+        integer = 0;
         p->pos++;
         if (peek(p) == '+' || peek(p) == '-') p->pos++;
         if (!(peek(p) >= '0' && peek(p) <= '9')) return perr(p, "invalid number");
         while (peek(p) >= '0' && peek(p) <= '9') p->pos++;
     }
-    return px_number(p->vm, px_decimal_to_double(p->s->wide ? (const void *)(px_str_u16(p->s) + start)
-                                                            : (const void *)(px_str_l1(p->s) + start),
-                                                    p->s->wide, p->pos - start));
+    /* integers: no double arithmetic (software on the PSP), no boxing; -0 is a double */
+    if (integer && digits <= 9 && !(neg && v == 0)) return px_from_smi(neg ? -v : v);
+    return px_number(p->vm, px_decimal_to_double(text_at(p, start), p->wide, p->pos - start));
 }
 
 static int literal(JParse *p, const char *word) {
     size_t i, n = strlen(word);
     for (i = 0; i < n; i++)
-        if (p->pos + i >= p->s->len || px_str_at(p->s, p->pos + (uint32_t)i) != (uint16_t)word[i]) return 0;
+        if (p->pos + i >= p->len || JCH(p, p->pos + (uint32_t)i) != (uint16_t)word[i]) return 0;
     p->pos += (uint32_t)n;
     return 1;
 }
@@ -479,7 +690,7 @@ static PxValue parse_value(JParse *p) {
     uint16_t c;
     skip_ws(p);
     c = peek(p);
-    if (c == '"') return parse_string(p);
+    if (c == '"') return parse_string(p, 0);
     if (c == '-' || (c >= '0' && c <= '9')) return parse_number(p);
     if (c == 't' && literal(p, "true")) return PX_TRUE;
     if (c == 'f' && literal(p, "false")) return PX_FALSE;
@@ -504,9 +715,7 @@ static PxValue parse_value(JParse *p) {
                         perr(p, "expected a property name");
                         goto fail;
                     }
-                    key = parse_string(p);
-                    if (key == PX_EXCEPTION) goto fail;
-                    key = px_intern(vm, key);
+                    key = parse_string(p, 1);
                     if (key == PX_EXCEPTION) goto fail;
                     skip_ws(p);
                     if (peek(p) != ':') {
@@ -544,7 +753,7 @@ static PxValue parse_value(JParse *p) {
         px_pop_roots(vm, 1);
         return PX_EXCEPTION;
     }
-    return perr(p, p->pos >= p->s->len ? "unexpected end of input" : "unexpected character");
+    return perr(p, p->pos >= p->len ? "unexpected end of input" : "unexpected character");
 }
 
 /* InternalizeJSONProperty: the reviver sees every value bottom-up; what it
@@ -616,22 +825,28 @@ static int revive_member(PxVM *vm, PxValue reviver, PxValue obj, PxValue key, in
 }
 
 static PxValue json_parse(PxVM *vm, PxValue t, int argc, PxValue *argv) {
-    JParse  p;
-    PxValue text = px_to_string(vm, px_arg(argc, argv, 0)), r;
+    JParse    p;
+    PxString *fs;
+    PxValue   text = px_to_string(vm, px_arg(argc, argv, 0)), r;
     (void)t;
     if (text == PX_EXCEPTION) return text;
     PX_ROOT(vm, text);
     memset(&p, 0, sizeof p);
     p.vm = vm;
-    p.s  = px_str_flat(vm, text);
-    if (!p.s) {
+    fs   = px_str_flat(vm, text);
+    if (!fs) {
         px_pop_roots(vm, 1);
         return PX_EXCEPTION;
     }
+    text  = px_from_ptr(fs); /* the flat copy stays rooted: the parser reads its characters */
+    p.wide = fs->wide;
+    p.len  = fs->len;
+    p.b8   = px_str_l1(fs);
+    p.b16  = px_str_u16(fs);
     r = parse_value(&p);
     if (r != PX_EXCEPTION) {
         skip_ws(&p);
-        if (p.pos < p.s->len) r = perr(&p, "unexpected data after the value");
+        if (p.pos < p.len) r = perr(&p, "unexpected data after the value");
     }
     free(p.buf);
     if (r != PX_EXCEPTION && px_is_callable(px_arg(argc, argv, 1))) {

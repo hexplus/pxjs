@@ -29,7 +29,6 @@ static int str_wide(PxValue v) {
     return px_type_of(v) == PX_T_STRING ? ((PxString *)px_ptr(v))->wide : ((PxRope *)px_ptr(v))->wide;
 }
 
-uint16_t px_str_at(const PxString *s, uint32_t i) { return s->wide ? px_str_u16(s)[i] : px_str_l1(s)[i]; }
 
 static PxString *str_alloc(PxVM *vm, uint32_t len, int wide) {
     PxString *s;
@@ -428,6 +427,44 @@ PxValue px_intern_cstr(PxVM *vm, const char *cs) {
     PxValue v = px_str_from_cstr(vm, cs);
     if (v == PX_EXCEPTION) return v;
     return px_intern(vm, v);
+}
+
+PxValue px_intern_chars(PxVM *vm, const void *text, int wide, uint32_t len) {
+    const uint8_t  *b8  = (const uint8_t *)text;
+    const uint16_t *b16 = (const uint16_t *)text;
+    uint32_t        h = 2166136261u, i, j, v = 0;
+    PxValue         s;
+#define CH(k) (wide ? b16[k] : b8[k])
+    /* an array index is a SMI key (as array_index decides) */
+    if (len > 0 && len <= 10 && !(len > 1 && CH(0) == '0')) {
+        for (i = 0; i < len; i++) {
+            uint32_t c = CH(i);
+            if (c < '0' || c > '9' || v > (uint32_t)PX_SMI_MAX / 10u) break;
+            v = v * 10u + (c - '0');
+        }
+        if (i == len && v <= (uint32_t)PX_SMI_MAX) return px_from_smi((int32_t)v);
+    }
+    for (i = 0; i < len; i++) { /* str_hash */
+        h ^= CH(i);
+        h *= 16777619u;
+    }
+    if (!h) h = 1;
+    if (vm->atoms_cap)
+        for (j = h & (vm->atoms_cap - 1); vm->atoms[j]; j = (j + 1) & (vm->atoms_cap - 1)) {
+            PxString *a = vm->atoms[j];
+            if (a->hash != h || a->len != len) continue;
+            if (!a->wide && !wide) {
+                if (memcmp(px_str_l1(a), b8, len) == 0) return px_from_ptr(a);
+            } else {
+                for (i = 0; i < len && px_str_at(a, i) == CH(i); i++) {}
+                if (i == len) return px_from_ptr(a);
+            }
+        }
+#undef CH
+    s = wide ? px_str_new_u16(vm, b16, len) : px_str_new_l1(vm, b8, len);
+    if (s == PX_EXCEPTION) return s;
+    ((PxString *)px_ptr(s))->hash = h;
+    return intern_string(vm, (PxString *)px_ptr(s));
 }
 
 /* The table does not keep strings alive: a name no code or object uses

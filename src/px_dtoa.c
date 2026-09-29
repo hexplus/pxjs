@@ -155,18 +155,21 @@ static void decompose(double v, uint64_t *f, int *e) {
 }
 
 static int bit_length(uint64_t f) {
-    int n = 0;
-    while (f) {
-        n++;
-        f >>= 1;
-    }
-    return n;
+    /* clz is one instruction on MIPS32 (and x86); f > 0 */
+    uint32_t hi = (uint32_t)(f >> 32);
+    return hi ? 64 - __builtin_clz(hi) : 32 - __builtin_clz((uint32_t)f);
 }
 
 /* An estimate of ceil(log10(v)) for v = f * 2^e, never too large and at
- * most one too small. */
+ * most one too small: ceil(x * log10(2)) for x = floor(log2(v)), in integer
+ * arithmetic ((x * 78913) >> 18 is floor(x * log10(2)) for 0 <= x <= 1650,
+ * and x * log10(2) is never an integer but for x = 0). Doubles are software
+ * routines on the PSP. */
 static int estimate_k(uint64_t f, int e) {
-    return (int)ceil((double)(e + bit_length(f) - 1) * 0.30102999566398114 - 1e-10);
+    int x = e + bit_length(f) - 1;
+    if (x > 0) return (int)(((uint32_t)x * 78913u) >> 18) + 1;
+    if (x == 0) return 0;
+    return -(int)(((uint32_t)-x * 78913u) >> 18);
 }
 
 int px_dtoa_shortest(double v, char *digits, int *kout) {
@@ -585,7 +588,8 @@ double px_decimal_to_double(const void *text, int wide, size_t len) {
     exp10 += e;
     /* the digits as an integer: m * 10^(exp10 - nd) */
 #if FLT_EVAL_METHOD == 0 /* one IEEE double operation: not on x87, which would round twice */
-    if (nd <= 15 && !sticky) {
+    /* m < 2^53 is exact as a double: one correctly rounded operation */
+    if (nd <= 16 && !sticky && m <= 9007199254740992ull) {
         long   s = exp10 - nd;
         double v = (double)m;
         if (s >= 0 && s <= 22) return neg ? -(v * p10[s]) : v * p10[s];

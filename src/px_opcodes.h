@@ -172,3 +172,11 @@ OP(ITER_STEP_AT, 1, 1)       /* -> the next value (undefined once done)   u8 loc
 OP(ITER_REST_AT, 1, 1)       /* -> an array of the remaining values       u8 local */
 OP(ITER_CLOSE_ABRUPT, 0, -2) /* exc iter -> (closes iter, then throws exc: return() errors lose, except
                                 after a generator's return) */
+/* compare-and-branch: LT..GE followed by JUMP_IF_FALSE, fused by the
+ * compiler (a loop's `i < n` test): a b -> (jump if not a OP b)  s16 offset */
+OP(LT_JUMP_IF_FALSE, 2, -2)
+OP(LE_JUMP_IF_FALSE, 2, -2)
+OP(GT_JUMP_IF_FALSE, 2, -2)
+OP(GE_JUMP_IF_FALSE, 2, -2)
+OP(SEQ_JUMP_IF_FALSE, 2, -2) /* === and !== the same way (if-chains on a value) */
+OP(SNE_JUMP_IF_FALSE, 2, -2)
