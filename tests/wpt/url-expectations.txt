@@ -1,0 +1,4 @@
+# Expected failures of tools/url_wpt.py: one test ID per line, as the tool
+# prints it ("parse <input> <base>" or "set <property> <href> <value>").
+# A comment line gives the reason for the lines under it. Empty: every test
+# of the pinned data passes.

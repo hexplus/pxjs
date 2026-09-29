@@ -1,4 +1,5 @@
-/* Web-platform functions apps expect to find: structuredClone, atob, btoa.
+/* Web-platform functions apps expect to find: structuredClone, atob, btoa,
+ * URL and URLSearchParams.
  *
  * They are HTML, not ECMAScript, but PSPX has no browser around the engine
  * to provide them, and code written for the web uses them freely.
@@ -384,11 +385,85 @@ fail:
     return PX_EXCEPTION;
 }
 
+/* ------------------------------------------------------------ URL, URLSearchParams
+ *
+ * Written in JavaScript (src/js/url.js, embedded by tools/embed_js.py) and
+ * compiled on first use: the two globals start as accessors, and the first
+ * read of either compiles the file and replaces both with the classes (as
+ * ordinary writable, non-enumerable globals). Programs that never use them
+ * pay neither the compile time nor the memory. */
+
+#include "px_url_js.h"
+
+static const char *const k_url_names[] = {"URL", "URLSearchParams"};
+/* the accessors' own names, as for any built-in accessor */
+static const char *const k_url_getters[] = {"get URL", "get URLSearchParams"};
+static const char *const k_url_setters[] = {"set URL", "set URLSearchParams"};
+
+/* The classes, compiled now if needed: 0, or -1 with the exception set. */
+static int url_load(PxVM *vm) {
+    PxValue init = PX_UNDEFINED, obj = PX_UNDEFINED, v;
+    int     i, rc = -1;
+    PX_ROOT(vm, init);
+    PX_ROOT(vm, obj);
+    if (px_eval(vm, k_url_js, sizeof k_url_js - 1, "<URL>", &init) != 0) goto out;
+    obj = px_call(vm, init, PX_UNDEFINED, 0, NULL);
+    if (obj == PX_EXCEPTION) goto out;
+    for (i = 0; i < 2; i++) {
+        PxValue key = px_intern_cstr(vm, k_url_names[i]);
+        if (key == PX_EXCEPTION) goto out;
+        v = px_get(vm, obj, key);
+        if (v == PX_EXCEPTION || px_define(vm, vm->global, key, v, PX_ATTR_HIDDEN) < 0) goto out;
+    }
+    rc = 0;
+out:
+    px_pop_roots(vm, 2);
+    return rc;
+}
+
+/* get URL (magic 0) / get URLSearchParams (1) */
+static PxValue url_get(PxVM *vm, PxValue t, int argc, PxValue *argv) {
+    int     which = vm->native_magic;
+    PxValue key;
+    (void)t;
+    (void)argc;
+    (void)argv;
+    if (url_load(vm) < 0) return PX_EXCEPTION;
+    key = px_intern_cstr(vm, k_url_names[which]);
+    return key == PX_EXCEPTION ? key : px_get(vm, vm->global, key);
+}
+
+/* URL = x before any read: the global simply becomes x */
+static PxValue url_set(PxVM *vm, PxValue t, int argc, PxValue *argv) {
+    PxValue key = px_intern_cstr(vm, k_url_names[vm->native_magic]);
+    (void)t;
+    if (key == PX_EXCEPTION) return key;
+    return px_define(vm, vm->global, key, px_arg(argc, argv, 0), PX_ATTR_HIDDEN) < 0 ? PX_EXCEPTION : PX_UNDEFINED;
+}
+
+static int url_install(PxVM *vm) {
+    int i;
+    for (i = 0; i < 2; i++) {
+        PxValue g = PX_UNDEFINED, s = PX_UNDEFINED, key;
+        int     r;
+        PX_ROOT(vm, g);
+        PX_ROOT(vm, s);
+        g   = px_make_native(vm, url_get, k_url_getters[i], 0, i);
+        s   = g == PX_EXCEPTION ? g : px_make_native(vm, url_set, k_url_setters[i], 1, i);
+        key = s == PX_EXCEPTION ? s : px_intern_cstr(vm, k_url_names[i]);
+        r   = key == PX_EXCEPTION ? -1 : px_define_accessor(vm, vm->global, key, g, s, PX_ATTR_CONFIGURABLE);
+        px_pop_roots(vm, 2);
+        if (r < 0) return -1;
+    }
+    return 0;
+}
+
 int px_web_init(PxVM *vm) {
     static const PxFnDef fns[] = {
         {"structuredClone", structured_clone, 1, 0},
         {"atob", atob_fn, 1, 0},
         {"btoa", btoa_fn, 1, 0},
     };
-    return px_def_fns(vm, vm->global, fns, PX_COUNTOF(fns));
+    if (px_def_fns(vm, vm->global, fns, PX_COUNTOF(fns)) < 0) return -1;
+    return url_install(vm);
 }
