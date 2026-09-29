@@ -167,6 +167,8 @@ PSP timings (PPSSPP, 222 MHz), µs per operation:
 | `toFixed(2)` | 47 | 19 | 9 |
 | `JSON.stringify`, per double | 853 | 41 | 19 |
 
+These have improved further since; see [performance.md](performance.md). Batch 1 brought double → string to 21.7 µs, `toFixed(2)` to 15.5 µs and `JSON.stringify` to 14.3 µs.
+
 **Host floating point:**
 
 - The host build (32-bit x86) computed doubles on the x87 unit. The x87 works in 80 bits and rounds twice, where the PSP's software doubles round once, as IEEE 754 requires.
@@ -190,8 +192,8 @@ Findings:
 
 - **Native → JS is 1.7× QuickJS.** `px_call` re-enters the dispatch loop (`run`) for every call. It matters for callbacks called from C: timers, events, the UI tree.
 - **The empty loop is six instructions per iteration** (`GET_LOCAL`, `GET_UPVAL_CHECK`, `LT`, `JUMP_IF_FALSE`, `INC_LOCAL`, `LOOP`): about 145 emulated cycles, 24 per instruction.
-  - A fused compare-and-branch would remove one dispatch in six.
-  - Not done: PPSSPP's timing is not the hardware's, and the gain should be measured on a PSP-1000 first.
+  - A fused compare-and-branch removes one dispatch in six. It was added in the performance work ([performance.md](performance.md)), and the empty loop went from 651 to 574 ns.
+  - Native → JS went from 1309 to 1006 ns with a short path in `px_call` and an inlined frame setup.
 
 **Startup:** `px_new` (all built-ins) takes 7.0 ms and leaves 58 kB live in 1,438 cells. QuickJS takes 4.0 ms and 145 kB.
 
