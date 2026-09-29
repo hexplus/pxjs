@@ -169,6 +169,11 @@ int px_set_finalizer(PxVM *vm, PxValue obj, void (*fn)(void *opaque), void *opaq
 PxValue px_new_uint8_clamped_array(PxVM *vm, uint32_t len, uint8_t **data); /* zeroed */
 /* The bytes behind a typed array or DataView: 0, or -1 if v is neither. */
 int px_typed_array_bytes(PxValue v, uint8_t **data, size_t *len);
+/* A new ArrayBuffer of len bytes (zeroed); *data points at them. */
+PxValue px_new_array_buffer(PxVM *vm, uint32_t len, uint8_t **data);
+/* The bytes of an ArrayBuffer (NULL and 0 once detached): 0, or -1 if v
+ * is not an ArrayBuffer. */
+int px_array_buffer_bytes(PxValue v, uint8_t **data, size_t *len);
 
 /* ------------------------------------------------------------ modules
  *

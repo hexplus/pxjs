@@ -618,6 +618,24 @@ PxValue px_new_uint8_clamped_array(PxVM *vm, uint32_t len, uint8_t **data) {
     return out;
 }
 
+PxValue px_new_array_buffer(PxVM *vm, uint32_t len, uint8_t **data) {
+    PxValue out = buffer_new(vm, len);
+    if (out != PX_EXCEPTION && data) *data = buf_data(out);
+    return out;
+}
+
+int px_array_buffer_bytes(PxValue v, uint8_t **data, size_t *len) {
+    if (!is_a(v, PX_T_ARRAYBUFFER)) return -1;
+    if (detached(v)) {
+        *data = NULL;
+        *len  = 0;
+        return 0;
+    }
+    *data = buf_data(v);
+    *len  = ((PxArrayBuffer *)px_ptr(v))->len;
+    return 0;
+}
+
 int px_typed_array_bytes(PxValue v, uint8_t **data, size_t *len) {
     PxTyped *t;
     if (!is_a(v, PX_T_TYPEDARRAY) && !is_a(v, PX_T_DATAVIEW)) return -1;
