@@ -40,7 +40,7 @@
 #define MAX_UPVALS  250
 #define MAX_LOOPS   64
 #define MAX_TRYS    32
-#define MAX_HOISTS  128
+#define MAX_HOISTS  1024 /* function declarations in one block: a bundled app has hundreds at its top level */
 #define MAX_DEPTH   150 /* nested expressions/statements: bounds the C stack */
 #define MAX_DECLS   1024
 #define MAX_PARAMS  64
