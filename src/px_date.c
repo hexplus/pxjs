@@ -18,6 +18,10 @@
 
 #include "px_internal.h"
 
+#if defined(__psp__)
+#include <psprtc.h>
+#endif
+
 #define ARG(i) px_arg(argc, argv, (i))
 #define MAGIC  (vm->native_magic)
 
@@ -153,6 +157,13 @@ static void split(double t, int local, Fields *f) {
 
 static double now_ms(void) {
     struct timeval tv;
+#if defined(__psp__)
+    /* Not gettimeofday there: on a PSP-1000 (6.61) it counted from about
+     * the boot, and Date.now() came out in 1970. The RTC tick is UTC, in
+     * microseconds since 0001-01-01. */
+    u64 tick;
+    if (sceRtcGetCurrentTick(&tick) >= 0) return (double)(tick / 1000u) - 62135596800000.0;
+#endif
     gettimeofday(&tv, NULL);
     return (double)tv.tv_sec * 1000.0 + (double)(tv.tv_usec / 1000);
 }
