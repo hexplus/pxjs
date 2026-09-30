@@ -219,10 +219,21 @@ PxValue px_promise_result(PxValue v);
 
 /* ------------------------------------------------------------ control */
 
-/* Called now and then while JS runs; return nonzero to abort the running
- * script with an uncatchable error. */
+/* Called now and then while JS runs. Return 0 to carry on; nonzero to
+ * abort the running script with an uncatchable error; or
+ * PX_INTERRUPT_THROWN after throwing an exception of your own there
+ * (px_throw_error: the script may catch it; px_throw_uncatchable: it may
+ * not). */
+#define PX_INTERRUPT_THROWN 2
 typedef int (*PxInterruptFn)(PxVM *vm, void *opaque);
 void px_set_interrupt(PxVM *vm, PxInterruptFn fn, void *opaque);
+
+/* Called when an allocation fails, just before the script gets its
+ * InternalError: out of memory (which it may catch). For the host's
+ * records: it must not call into the VM or allocate from it (px_mem_stats
+ * is fine). */
+typedef void (*PxOomFn)(PxVM *vm, void *opaque);
+void px_set_oom_handler(PxVM *vm, PxOomFn fn, void *opaque);
 
 typedef struct PxMemStats {
     size_t heap_bytes;  /* arena size */

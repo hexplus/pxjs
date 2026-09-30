@@ -634,6 +634,9 @@ struct PxVM {
     PxInterruptFn interrupt;
     void     *interrupt_opaque;
     int       uncatchable;
+    PxOomFn   oom_fn;
+    void     *oom_opaque;
+    int       in_oom_fn;
     int       native_magic; /* the magic of the native function being called */
     PxValue   native_callee; /* and the function itself */
     PxValue   native_data;   /* and its data */

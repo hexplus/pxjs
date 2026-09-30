@@ -89,6 +89,11 @@ void px_set_interrupt(PxVM *vm, PxInterruptFn fn, void *opaque) {
     vm->interrupt_opaque = opaque;
 }
 
+void px_set_oom_handler(PxVM *vm, PxOomFn fn, void *opaque) {
+    vm->oom_fn     = fn;
+    vm->oom_opaque = opaque;
+}
+
 static void describe_exception(PxVM *vm) {
     PxValue e = vm->exception;
     PX_ROOT(vm, e);

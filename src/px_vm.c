@@ -69,6 +69,11 @@ PxValue px_throw(PxVM *vm, PxValue exc) {
 }
 
 PxValue px_throw_oom(PxVM *vm) {
+    if (vm->oom_fn && !vm->in_oom_fn) {
+        vm->in_oom_fn = 1;
+        vm->oom_fn(vm, vm->oom_opaque);
+        vm->in_oom_fn = 0;
+    }
     vm->exception = vm->oom_error;
     return PX_EXCEPTION;
 }
@@ -437,13 +442,13 @@ static PxValue call_native(PxVM *vm, PxNative *n, PxValue this_val, int argc, Px
 /* ------------------------------------------------------------ frames */
 
 int px_check_interrupt(PxVM *vm) {
+    int rc;
     vm->interrupt_counter = INTERRUPT_PERIOD;
-    if (vm->interrupt && vm->interrupt(vm, vm->interrupt_opaque)) {
-        px_throw_error(vm, PX_INTERNAL_ERROR, "interrupted");
-        vm->uncatchable = 1;
-        return -1;
-    }
-    return 0;
+    if (!vm->interrupt || !(rc = vm->interrupt(vm, vm->interrupt_opaque))) return 0;
+    if (rc == PX_INTERRUPT_THROWN) return -1; /* the host threw its own */
+    px_throw_error(vm, PX_INTERNAL_ERROR, "interrupted");
+    vm->uncatchable = 1;
+    return -1;
 }
 
 static PxClosure *make_closure(PxVM *vm, PxProto *p, PxFrame *f) {
