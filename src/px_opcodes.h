@@ -180,3 +180,7 @@ OP(GT_JUMP_IF_FALSE, 2, -2)
 OP(GE_JUMP_IF_FALSE, 2, -2)
 OP(SEQ_JUMP_IF_FALSE, 2, -2) /* === and !== the same way (if-chains on a value) */
 OP(SNE_JUMP_IF_FALSE, 2, -2)
+/* a local past slot 255: WIDE, then one of GET_LOCAL, SET_LOCAL, PUT_LOCAL,
+ * GET_LOCAL_CHECK, SET_LOCAL_CHECK, INIT_HOLE, CLOSE_UPVALS, ITER_STEP_AT or
+ * ITER_REST_AT, then the slot as u16 (the stack effect is that op's) */
+OP(WIDE, 3, 0)

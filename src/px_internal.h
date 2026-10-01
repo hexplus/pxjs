@@ -256,7 +256,7 @@ typedef struct PxProto {
     PxBytes *code;
     PxVec   *consts; /* strings, numbers, nested PxProtos */
     PxBytes *lines;  /* (pc delta, line delta) pairs, varint */
-    PxBytes *upval_desc; /* per upvalue: byte is_local, byte index */
+    PxBytes *upval_desc; /* per upvalue: byte is_local, then the index in two bytes (little-endian) */
     PxBytes *ics;        /* PxIC per property-access site, or NULL */
     PxValue  name;
     PxValue  filename;

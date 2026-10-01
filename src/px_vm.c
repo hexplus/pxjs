@@ -479,7 +479,9 @@ static PxClosure *make_closure(PxVM *vm, PxProto *p, PxFrame *f) {
         PxValue cv = px_from_ptr(c);
         PX_ROOT(vm, cv);
         for (i = 0; i < p->nupvals; i++) {
-            uint8_t is_local = p->upval_desc->data[2 * i], idx = p->upval_desc->data[2 * i + 1];
+            const uint8_t *d        = p->upval_desc->data + 3 * i;
+            uint8_t        is_local = d[0];
+            uint16_t       idx      = (uint16_t)(d[1] | d[2] << 8);
             if (is_local) {
                 PxUpval *u = capture(vm, f->base + idx);
                 if (!u) {
@@ -1674,6 +1676,7 @@ static PxValue run(PxVM *vm, uint32_t entry, int throw_now) {
     const uint8_t *pc = f->pc;
     PxValue       *sp = vm->sp;
     PxOp           op = OP_NOP;
+    uint32_t       li = 0; /* the local of ITER_STEP_AT / ITER_REST_AT (OP_WIDE jumps in with its own) */
 
     if (throw_now) goto exception;
     for (;;) {
@@ -1772,6 +1775,42 @@ static PxValue run(PxVM *vm, uint32_t entry, int throw_now) {
             break;
         }
         case OP_CLOSE_UPVALS: close_upvals(vm, f->base + READ_U8()); break;
+        case OP_WIDE: {
+            /* a local past slot 255: the op, then the slot in two bytes */
+            PxOp     wop = (PxOp)READ_U8();
+            uint16_t i   = READ_U16();
+            PX_PROF(vm->prof.op_count[wop]++);
+            switch (wop) {
+            case OP_GET_LOCAL: PUSH(f->base[i]); break;
+            case OP_SET_LOCAL: f->base[i] = TOP(); break;
+            case OP_PUT_LOCAL: f->base[i] = POP(); break;
+            case OP_INIT_HOLE: f->base[i] = PX_HOLE; break;
+            case OP_CLOSE_UPVALS: close_upvals(vm, f->base + i); break;
+            case OP_GET_LOCAL_CHECK:
+                if (f->base[i] == PX_HOLE) {
+                    SAVE();
+                    px_throw_error(vm, PX_REFERENCE_ERROR, "variable used before its declaration");
+                    THROW();
+                }
+                PUSH(f->base[i]);
+                break;
+            case OP_SET_LOCAL_CHECK:
+                if (f->base[i] == PX_HOLE) {
+                    SAVE();
+                    px_throw_error(vm, PX_REFERENCE_ERROR, "variable assigned before its declaration");
+                    THROW();
+                }
+                f->base[i] = TOP();
+                break;
+            case OP_ITER_STEP_AT: li = i; goto iter_step_at;
+            case OP_ITER_REST_AT: li = i; goto iter_rest_at;
+            default:
+                SAVE();
+                px_throw_error(vm, PX_INTERNAL_ERROR, "bad wide instruction %d", (int)wop);
+                THROW();
+            }
+            break;
+        }
         case OP_THROW_REF: {
             char    msg[160];
             PxValue m = CONSTS[READ_U16()];
@@ -2586,17 +2625,21 @@ static PxValue run(PxVM *vm, uint32_t entry, int throw_now) {
             if (r < 0) THROW();
             break;
         }
-        case OP_ITER_STEP_AT: {
+        case OP_ITER_STEP_AT:
+            li = READ_U8();
+        iter_step_at: {
             PxValue v = PX_UNDEFINED;
             int     r;
             SAVE();
-            r = iter_next(vm, (PxIter *)px_ptr(f->base[READ_U8()]), &v);
+            r = iter_next(vm, (PxIter *)px_ptr(f->base[li]), &v);
             if (r < 0) THROW();
             PUSH(r ? v : PX_UNDEFINED);
             break;
         }
-        case OP_ITER_REST_AT: {
-            PxIter *it = (PxIter *)px_ptr(f->base[READ_U8()]);
+        case OP_ITER_REST_AT:
+            li = READ_U8();
+        iter_rest_at: {
+            PxIter *it = (PxIter *)px_ptr(f->base[li]);
             PxValue a, v;
             int     r;
             SAVE();

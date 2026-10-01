@@ -36,7 +36,7 @@
 #include "px_internal.h"
 #include "px_lexer.h"
 
-#define MAX_LOCALS  250
+#define MAX_LOCALS  1024 /* a bundled app's top level has hundreds; slots past 255 take OP_WIDE */
 #define MAX_UPVALS  250
 #define MAX_LOOPS   64
 #define MAX_TRYS    32
@@ -59,7 +59,8 @@ typedef struct Local {
 
 typedef struct Upv {
     PxValue name;
-    uint8_t is_local, index, kind;
+    uint8_t  is_local, kind;
+    uint16_t index;
 } Upv;
 
 typedef struct IntList {
@@ -630,6 +631,11 @@ static int peephole_pop(Compiler *C) {
         adjust(C, -1);
         return 1;
     }
+    if (last == OP_WIDE && fs->code[fs->ops[fs->nops - 1] + 1] == OP_SET_LOCAL) {
+        fs->code[fs->ops[fs->nops - 1] + 1] = OP_PUT_LOCAL;
+        adjust(C, -1);
+        return 1;
+    }
     return 0;
 }
 
@@ -670,6 +676,22 @@ static void emit_u16(Compiler *C, int v) {
 static void emit_op_u16(Compiler *C, PxOp op, int v) {
     emit_op(C, op);
     emit_u16(C, v);
+}
+
+/* An instruction on local `slot`: its one-byte operand, or past 255 the
+ * OP_WIDE prefix with the slot in two bytes (a bundled app's top level has
+ * hundreds of locals). The fusions in peephole_pop see OP_WIDE and leave
+ * it alone. */
+static void emit_local(Compiler *C, PxOp op, int slot) {
+    if (slot < 256) {
+        emit_op_u8(C, op, slot);
+        return;
+    }
+    note_op(C->fs);
+    emit_byte(C, (uint8_t)OP_WIDE);
+    emit_byte(C, (uint8_t)op);
+    emit_u16(C, slot);
+    adjust(C, px_op_effect[op]);
 }
 
 /* Returns the position of the 16-bit offset, to patch. */
@@ -821,7 +843,7 @@ static int add_upval(Compiler *C, FuncState *fs, PxValue name, int is_local, int
     if (fs->nupvals >= MAX_UPVALS) fail(C, "RangeError: too many captured variables in one function");
     fs->upvals[fs->nupvals].name     = name;
     fs->upvals[fs->nupvals].is_local = (uint8_t)is_local;
-    fs->upvals[fs->nupvals].index    = (uint8_t)index;
+    fs->upvals[fs->nupvals].index    = (uint16_t)index;
     fs->upvals[fs->nupvals].kind     = (uint8_t)kind;
     return fs->nupvals++;
 }
@@ -885,7 +907,7 @@ static void discharge(Compiler *C, Exp *e) {
         if ((e->idx >= C->fs->tdz_lo && e->idx < C->fs->tdz_hi) || (e->idx >= C->fs->tdz_lo2 && e->idx < C->fs->tdz_hi2))
             emit_throw_ref(C, "'%s' is used before its initialisation", e->name);
         else
-            emit_op_u8(C, needs_tdz(C, e) ? OP_GET_LOCAL_CHECK : OP_GET_LOCAL, e->idx);
+            emit_local(C, needs_tdz(C, e) ? OP_GET_LOCAL_CHECK : OP_GET_LOCAL, e->idx);
         break;
     case E_UPVAL: emit_op_u8(C, IS_LEXICAL(e->kind) ? OP_GET_UPVAL_CHECK : OP_GET_UPVAL, e->idx); break;
     case E_GLOBAL: emit_op_u16(C, OP_GET_GLOBAL, e->idx); break;
@@ -908,7 +930,7 @@ static void store(Compiler *C, Exp *e) {
             emit_op_u16(C, OP_THROW_CONST, add_const(C, e->name));
             return;
         }
-        if (e->k == E_LOCAL) emit_op_u8(C, needs_tdz(C, e) ? OP_SET_LOCAL_CHECK : OP_SET_LOCAL, e->idx);
+        if (e->k == E_LOCAL) emit_local(C, needs_tdz(C, e) ? OP_SET_LOCAL_CHECK : OP_SET_LOCAL, e->idx);
         else emit_op_u8(C, IS_LEXICAL(e->kind) ? OP_SET_UPVAL_CHECK : OP_SET_UPVAL, e->idx);
         break;
     case E_GLOBAL: emit_op_u16(C, OP_SET_GLOBAL, e->idx); break;
@@ -2146,7 +2168,7 @@ static void init_name(Compiler *C, PxValue name, int kind) {
     FuncState *fs = C->fs;
     resolve(C, name, &e);
     if (e.k == E_LOCAL) {
-        emit_op_u8(C, OP_PUT_LOCAL, e.idx);
+        emit_local(C, OP_PUT_LOCAL, e.idx);
         /* From here on in this function the binding is initialised: the
          * code after a declaration only runs after the declaration ran.
          * Except in a switch body, where a case label can jump past a
@@ -2196,23 +2218,23 @@ typedef struct Source {
 static void emit_source(Compiler *C, const Source *s) {
     int i;
     switch (s->how) {
-    case SRC_ITER: emit_op_u8(C, OP_ITER_STEP_AT, s->slot); break;
-    case SRC_ITER_REST: emit_op_u8(C, OP_ITER_REST_AT, s->slot); break;
+    case SRC_ITER: emit_local(C, OP_ITER_STEP_AT, s->slot); break;
+    case SRC_ITER_REST: emit_local(C, OP_ITER_REST_AT, s->slot); break;
     case SRC_PROP:
-        emit_op_u8(C, OP_GET_LOCAL, s->slot);
+        emit_local(C, OP_GET_LOCAL, s->slot);
         emit_prop(C, OP_GET_PROP, s->kcidx);
         break;
     case SRC_ELEM:
-        emit_op_u8(C, OP_GET_LOCAL, s->slot);
-        emit_op_u8(C, OP_GET_LOCAL, s->kslot);
+        emit_local(C, OP_GET_LOCAL, s->slot);
+        emit_local(C, OP_GET_LOCAL, s->kslot);
         emit_op(C, OP_GET_ELEM);
         break;
     default:
-        emit_op_u8(C, OP_GET_LOCAL, s->slot);
+        emit_local(C, OP_GET_LOCAL, s->slot);
         emit_op(C, OP_NEW_ARRAY);
         for (i = 0; i < s->nex; i++) {
             if (s->ex[i] >= 0) emit_op_u16(C, OP_CONST, s->ex[i]);
-            else emit_op_u8(C, OP_GET_LOCAL, ~s->ex[i]);
+            else emit_local(C, OP_GET_LOCAL, ~s->ex[i]);
             emit_op(C, OP_APPEND);
         }
         emit_op(C, OP_OBJ_REST);
@@ -2283,7 +2305,7 @@ static void bind_object_pattern(Compiler *C, int mode, int kind) {
     next(C); /* { */
     emit_op(C, OP_REQUIRE_OBJ);
     slot = declare_temp(C);
-    emit_op_u8(C, OP_PUT_LOCAL, slot);
+    emit_local(C, OP_PUT_LOCAL, slot);
     src.slot = slot;
     while (TOK != T_RBRACE) {
         if (nex >= 64) fail(C, "SyntaxError: too many properties in a destructuring pattern");
@@ -2305,7 +2327,7 @@ static void bind_object_pattern(Compiler *C, int mode, int kind) {
             src.how   = SRC_ELEM;
             src.kslot = declare_temp(C);
             ktemps++;
-            emit_op_u8(C, OP_PUT_LOCAL, src.kslot);
+            emit_local(C, OP_PUT_LOCAL, src.kslot);
             ex[nex++] = ~src.kslot;
             expect(C, T_COLON);
             bind_element(C, mode, kind, &src, 1);
@@ -2343,14 +2365,14 @@ static void bind_array_pattern(Compiler *C, int mode, int kind) {
     next(C); /* [ */
     emit_op(C, OP_ITER_START);
     slot = declare_temp(C);
-    emit_op_u8(C, OP_PUT_LOCAL, slot);
+    emit_local(C, OP_PUT_LOCAL, slot);
     base     = fs->stack;
     handler  = emit_jump(C, OP_TRY);
     src.slot = slot;
     while (TOK != T_RBRACKET) {
         if (TOK == T_COMMA) {
             next(C);
-            emit_op_u8(C, OP_ITER_STEP_AT, slot);
+            emit_local(C, OP_ITER_STEP_AT, slot);
             emit_op(C, OP_POP);
             continue;
         }
@@ -2367,12 +2389,12 @@ static void bind_array_pattern(Compiler *C, int mode, int kind) {
     }
     next(C);
     emit_op(C, OP_END_TRY);
-    emit_op_u8(C, OP_GET_LOCAL, slot);
+    emit_local(C, OP_GET_LOCAL, slot);
     emit_op(C, OP_ITER_CLOSE);
     jend = emit_jump(C, OP_JUMP);
     patch_here(C, handler);
     fs->stack = base + 1; /* the exception */
-    emit_op_u8(C, OP_GET_LOCAL, slot);
+    emit_local(C, OP_GET_LOCAL, slot);
     emit_op(C, OP_ITER_CLOSE_ABRUPT);
     fs->stack = base;
     patch_here(C, jend);
@@ -2887,7 +2909,7 @@ static void block_begin(Compiler *C, Block *b, int is_function_body, int *uses_a
         }
         {
             int slot = declare_local(C, name, kind);
-            if (IS_LEXICAL(kind)) emit_op_u8(C, OP_INIT_HOLE, slot);
+            if (IS_LEXICAL(kind)) emit_local(C, OP_INIT_HOLE, slot);
         }
     }
     decls_free(C, d);
@@ -2907,7 +2929,7 @@ static void block_end(Compiler *C, Block *b) {
             Hoist *h = &fs->hoists[i];
             emit_op_u16(C, OP_CLOSURE, h->cidx);
             if (h->is_global) emit_op_u16(C, OP_DEF_GLOBAL, h->name_cidx);
-            else emit_op_u8(C, OP_PUT_LOCAL, h->slot);
+            else emit_local(C, OP_PUT_LOCAL, h->slot);
         }
         emit_back(C, OP_JUMP, b->resume);
         patch_here(C, over);
@@ -2924,7 +2946,7 @@ static void close_from(Compiler *C, int from) {
     int        i;
     for (i = from; i < fs->nactive; i++)
         if (fs->locals[i].captured) {
-            emit_op_u8(C, OP_CLOSE_UPVALS, from);
+            emit_local(C, OP_CLOSE_UPVALS, from);
             return;
         }
 }
@@ -2987,12 +3009,13 @@ static PxProto *funcstate_finish(Compiler *C) {
     PxProto   *p;
     PxBytes   *code, *lines, *ud, *ics = NULL;
     PxValue    pv, cv, lv, iv = 0;
-    uint8_t    udesc[2 * MAX_UPVALS];
+    uint8_t    udesc[3 * MAX_UPVALS];
     int        i;
 
     for (i = 0; i < fs->nupvals; i++) {
-        udesc[2 * i]     = fs->upvals[i].is_local;
-        udesc[2 * i + 1] = fs->upvals[i].index;
+        udesc[3 * i]     = fs->upvals[i].is_local;
+        udesc[3 * i + 1] = (uint8_t)(fs->upvals[i].index & 0xFF);
+        udesc[3 * i + 2] = (uint8_t)(fs->upvals[i].index >> 8);
     }
     code = px_bytes_new(vm, fs->code, fs->len);
     check_alloc(C, code != NULL);
@@ -3002,7 +3025,7 @@ static PxProto *funcstate_finish(Compiler *C) {
     check_alloc(C, lines != NULL);
     lv = px_from_ptr(lines);
     PX_ROOT(vm, lv);
-    ud = px_bytes_new(vm, udesc, (uint32_t)(2 * fs->nupvals));
+    ud = px_bytes_new(vm, udesc, (uint32_t)(3 * fs->nupvals));
     check_alloc(C, ud != NULL);
     pv = px_from_ptr(ud);
     PX_ROOT(vm, pv);
@@ -3154,18 +3177,18 @@ static int parameters(Compiler *C) {
         fs->tdz_hi2 = first_name + names_before[n];
         if (ps[i].has_default) {
             int skip;
-            emit_op_u8(C, OP_GET_LOCAL, ps[i].slot);
+            emit_local(C, OP_GET_LOCAL, ps[i].slot);
             emit_op(C, OP_UNDEF);
             emit_op(C, OP_SEQ);
             skip = emit_jump(C, OP_JUMP_IF_FALSE);
             lex_restore(&C->lx, ps[i].dflt);
             if (!ps[i].pattern) C->name_hint = fs->locals[ps[i].slot].name;
             expr_value(C);
-            emit_op_u8(C, OP_PUT_LOCAL, ps[i].slot);
+            emit_local(C, OP_PUT_LOCAL, ps[i].slot);
             patch_here(C, skip);
         }
         if (ps[i].pattern) {
-            emit_op_u8(C, OP_GET_LOCAL, ps[i].slot);
+            emit_local(C, OP_GET_LOCAL, ps[i].slot);
             lex_restore(&C->lx, ps[i].pos);
             bind_target(C, BIND_DECL, K_VAR);
         }
@@ -3408,7 +3431,7 @@ static void define_field(Compiler *C, Member *mb, PxValue *privs, int is_static)
         hint = privs[mb->priv];
         next(C);
     } else if (mb->computed) {
-        if (is_static) emit_op_u8(C, OP_GET_LOCAL, mb->slot);
+        if (is_static) emit_local(C, OP_GET_LOCAL, mb->slot);
         else emit_op_u8(C, OP_GET_UPVAL, capture_local(C, mb->slot));
         skip_balanced(C);
     } else {
@@ -3483,7 +3506,7 @@ static void class_def(Compiler *C, PxValue name, int inner_binding) {
     scope_begin(C, &scope);
     if (inner_binding && px_is_ptr(name)) {
         inner = declare_local(C, name, K_CONST);
-        emit_op_u8(C, OP_INIT_HOLE, inner);
+        emit_local(C, OP_INIT_HOLE, inner);
     }
     if (TOK == T_EXTENDS) {
         Exp e;
@@ -3513,7 +3536,7 @@ static void class_def(Compiler *C, PxValue name, int inner_binding) {
             desc = px_intern_literal(C->vm, desc);
             check_alloc(C, desc != PX_EXCEPTION);
             emit_op_u16(C, OP_NEW_PRIVATE, add_const(C, desc));
-            emit_op_u8(C, OP_PUT_LOCAL, slot);
+            emit_local(C, OP_PUT_LOCAL, slot);
         }
         C->vm->nroots = roots0; /* the names are locals now */
     }
@@ -3535,7 +3558,7 @@ static void class_def(Compiler *C, PxValue name, int inner_binding) {
             if (derived) {
                 cfs->flags |= PX_PROTO_REST;
                 declare_local(C, 0, K_PARAM);
-                emit_op_u8(C, OP_GET_LOCAL, 0);
+                emit_local(C, OP_GET_LOCAL, 0);
                 emit_op(C, OP_SUPER_CALL_ARRAY);
                 emit_op(C, OP_INIT_FIELDS);
                 emit_op(C, OP_POP);
@@ -3562,7 +3585,7 @@ static void class_def(Compiler *C, PxValue name, int inner_binding) {
                 property_key(C, NULL);
                 emit_op(C, OP_TO_PROPKEY);
                 mb->slot = (int16_t)declare_temp(C);
-                emit_op_u8(C, OP_PUT_LOCAL, mb->slot);
+                emit_local(C, OP_PUT_LOCAL, mb->slot);
             }
             continue;
         }
@@ -3576,7 +3599,7 @@ static void class_def(Compiler *C, PxValue name, int inner_binding) {
             emit_op(C, OP_POP);
             if (mb->is_static) {
                 emit_op(C, OP_OVER);
-                emit_op_u8(C, OP_GET_LOCAL, find_local(fs, privs[mb->priv]));
+                emit_local(C, OP_GET_LOCAL, find_local(fs, privs[mb->priv]));
                 emit_op(C, OP_OVER);
             } else {
                 emit_op(C, OP_DUP);
@@ -3589,7 +3612,7 @@ static void class_def(Compiler *C, PxValue name, int inner_binding) {
                 emit_op(C, OP_POP);
             } else {
                 mb->slot = (int16_t)declare_temp(C);
-                emit_op_u8(C, OP_PUT_LOCAL, mb->slot);
+                emit_local(C, OP_PUT_LOCAL, mb->slot);
             }
             continue;
         }
@@ -3640,7 +3663,7 @@ static void class_def(Compiler *C, PxValue name, int inner_binding) {
      * fields and blocks run, in source order. */
     if (inner >= 0) {
         emit_op(C, OP_OVER);
-        emit_op_u8(C, OP_PUT_LOCAL, inner);
+        emit_local(C, OP_PUT_LOCAL, inner);
     }
     for (i = 0; i < n; i++) {
         if (!m[i].is_static || !(m[i].is_field || m[i].is_block)) continue;
@@ -3861,7 +3884,7 @@ static void for_in_of(Compiler *C, int decl_kind, int is_await) {
         Decls   *d      = decls_new(C, 1);
         lex_restore(&C->lx, target);
         scan_target(C, d, decl_kind);
-        for (i = 0; i < d->n; i++) emit_op_u8(C, OP_INIT_HOLE, declare_local(C, DECL_NAME(d, i), decl_kind));
+        for (i = 0; i < d->n; i++) emit_local(C, OP_INIT_HOLE, declare_local(C, DECL_NAME(d, i), decl_kind));
         decls_free(C, d);
         C->vm->nroots = roots0;
         lex_restore(&C->lx, here);
@@ -4008,7 +4031,7 @@ static void for_statement(Compiler *C) {
                 next(C);
             }
             scan_declarators(C, d, kind);
-            for (i = 0; i < d->n; i++) emit_op_u8(C, OP_INIT_HOLE, declare_local(C, DECL_NAME(d, i), kind));
+            for (i = 0; i < d->n; i++) emit_local(C, OP_INIT_HOLE, declare_local(C, DECL_NAME(d, i), kind));
             decls_free(C, d);
             C->vm->nroots = roots0;
             lex_restore(&C->lx, s2);
@@ -4051,7 +4074,7 @@ static void for_statement(Compiler *C) {
      * something captured one; the update is not compiled yet, so a
      * function there counts as a capture. */
     if (update_fn) {
-        if (fs->nactive > loop_var_start) emit_op_u8(C, OP_CLOSE_UPVALS, loop_var_start);
+        if (fs->nactive > loop_var_start) emit_local(C, OP_CLOSE_UPVALS, loop_var_start);
     } else {
         close_from(C, loop_var_start);
     }
@@ -4080,7 +4103,7 @@ static void switch_statement(Compiler *C) {
     expect(C, T_RPAREN);
     scope_begin(C, &scope);
     tmp = declare_temp(C);
-    emit_op_u8(C, OP_PUT_LOCAL, tmp);
+    emit_local(C, OP_PUT_LOCAL, tmp);
     if (TOK != T_LBRACE) expect(C, T_LBRACE);
     next(C);
     saved_floor = fs->switch_floor1;
@@ -4092,7 +4115,7 @@ static void switch_statement(Compiler *C) {
             next(C);
             if (have_body) fall = emit_jump(C, OP_JUMP);
             if (test_fail >= 0) patch_here(C, test_fail);
-            emit_op_u8(C, OP_GET_LOCAL, tmp);
+            emit_local(C, OP_GET_LOCAL, tmp);
             expr(C);
             emit_op(C, OP_SEQ);
             test_fail = emit_jump(C, OP_JUMP_IF_FALSE);
@@ -4176,7 +4199,7 @@ static void try_statement(Compiler *C) {
          * finally block (patched below), or on out */
         jfilter = emit_jump(C, OP_CATCH_FILTER);
         /* locals of the abandoned try block may be captured */
-        emit_op_u8(C, OP_CLOSE_UPVALS, fs->nactive);
+        emit_local(C, OP_CLOSE_UPVALS, fs->nactive);
         next(C); /* catch */
         scope_begin(C, &b);
         if (TOK == T_LPAREN) {
@@ -4194,7 +4217,7 @@ static void try_statement(Compiler *C) {
                 bind_target(C, BIND_DECL, K_VAR);
             } else {
                 int slot = declare_local(C, binding_name(C), K_VAR);
-                emit_op_u8(C, OP_PUT_LOCAL, slot);
+                emit_local(C, OP_PUT_LOCAL, slot);
             }
             expect(C, T_RPAREN);
             C->param_floor1 = b.nactive + 1; /* the block may not redeclare them */
@@ -4234,11 +4257,11 @@ static void try_statement(Compiler *C) {
         if (jfilter >= 0) patch_here(C, jfilter);
         fs->stack = base_stack + 1;
         if (fs->stack > fs->max_stack) fs->max_stack = fs->stack;
-        emit_op_u8(C, OP_CLOSE_UPVALS, fs->nactive);
+        emit_local(C, OP_CLOSE_UPVALS, fs->nactive);
         tmp = declare_temp(C);
-        emit_op_u8(C, OP_PUT_LOCAL, tmp);
+        emit_local(C, OP_PUT_LOCAL, tmp);
         compile_finally_at(C, finally_pos);
-        emit_op_u8(C, OP_GET_LOCAL, tmp);
+        emit_local(C, OP_GET_LOCAL, tmp);
         emit_op(C, OP_THROW);
         fs->nactive--;
         patch_here(C, jend);
@@ -4347,14 +4370,14 @@ static void import_declaration(Compiler *C) {
         LexState after = lex_save(&C->lx);
         int      first = 1;
         tmp            = declare_temp(C);
-        emit_op_u8(C, OP_PUT_LOCAL, tmp);
+        emit_local(C, OP_PUT_LOCAL, tmp);
         lex_restore(&C->lx, clause);
         for (;;) {
             if (TOK == T_STAR) {
                 next(C);
                 if (!tok_is_kw(C, "as")) fail(C, "SyntaxError: expected 'as'");
                 next(C);
-                emit_op_u8(C, OP_GET_LOCAL, tmp);
+                emit_local(C, OP_GET_LOCAL, tmp);
                 init_name(C, binding_name(C), K_CONST);
             } else if (TOK == T_LBRACE) {
                 next(C);
@@ -4373,7 +4396,7 @@ static void import_declaration(Compiler *C) {
                     }
                     local = binding_name(C);
                     PX_ROOT(C->vm, local);
-                    emit_op_u8(C, OP_GET_LOCAL, tmp);
+                    emit_local(C, OP_GET_LOCAL, tmp);
                     emit_prop(C, OP_GET_PROP, add_const(C, imported));
                     init_name(C, local, K_CONST);
                     px_pop_roots(C->vm, 2);
@@ -4382,7 +4405,7 @@ static void import_declaration(Compiler *C) {
                 next(C);
             } else if (first && TOK != T_LBRACE) {
                 /* default import */
-                emit_op_u8(C, OP_GET_LOCAL, tmp);
+                emit_local(C, OP_GET_LOCAL, tmp);
                 emit_prop(C, OP_GET_PROP, add_const(C, C->vm->atom[PX_ATOM_default]));
                 init_name(C, binding_name(C), K_CONST);
                 if (TOK != T_COMMA) break;
@@ -4671,7 +4694,7 @@ static void statement(Compiler *C) {
             break;
         }
         expr(C);
-        if (fs->is_script && fs->nloops == 0) emit_op_u8(C, OP_PUT_LOCAL, fs->completion);
+        if (fs->is_script && fs->nloops == 0) emit_local(C, OP_PUT_LOCAL, fs->completion);
         else emit_op(C, OP_POP);
         semicolon(C);
         break;
@@ -4761,7 +4784,7 @@ PxProto *px_compile(PxVM *vm, const char *src, size_t len, const char *filename,
         block_end(C, &b);
         if (module) emit_op(C, OP_RETURN_UNDEF);
         else {
-            emit_op_u8(C, OP_GET_LOCAL, fs->completion);
+            emit_local(C, OP_GET_LOCAL, fs->completion);
             emit_op(C, OP_RETURN);
         }
         p = funcstate_finish(C);
